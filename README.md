@@ -58,7 +58,7 @@ Only what is strictly necessary lives elsewhere:
 |---|---|
 | [`mecmcp`](https://github.com/mechubsec/mecmcp) | None planned — `mecmcp-changeset`, auth, audit and redaction are reused as-is. Upstream changes only if a concrete gap appears. |
 | [`rustpanosmcp`](https://github.com/mechubsec/rustpanosmcp), [`rustjunosmcp`](https://github.com/mechubsec/rustjunosmcp), [`rustfortimcp`](https://github.com/mechubsec/rustfortimcp), [`rustopnsmcp`](https://github.com/mechubsec/rustopnsmcp) | A **read-only feed-status tool** (subscribed? which version did the firewall last pull? entry count?) and docs for the one-time subscription. No new write power. |
-| mechub dashboard (planned) | Visualisation only: feed history, what was blocked and why, expiring entries, lagging firewalls. |
+| mechub console (planned) | Operator UI: feed history, what was blocked and why, expiring entries, lagging firewalls — and proposing, approving and applying feed changes **through mecfeedmcp's own change-set flow** (lab-mode or two-person approval as the server enforces). It never bypasses the server's approval. |
 
 ## Status
 
