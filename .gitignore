@@ -17,6 +17,7 @@ tokens.json
 
 test.log
 *.log
+proptest-regressions/
 .gstack/
 .review-codex/
 __pycache__/

@@ -1,5 +1,5 @@
 > [!WARNING]
-> 🚧 **Under construction — not usable.** `mecfeedmcp` has no working code yet. The design below is the agreed scope, not a description of shipped software. Do not deploy it.
+> 🚧 **Under construction — not usable.** `mecfeedmcp-core` can admit indicators and render feed documents. The MCP server does not publish feeds yet, and `mecfeed-serve` does not serve snapshots yet. Do not deploy it.
 
 <p align="center">
   <picture>
@@ -62,7 +62,7 @@ Only what is strictly necessary lives elsewhere:
 
 ## Status
 
-**Under construction — not usable.** P0 is the workspace, CI and release pipeline ([#1](https://github.com/mechubsec/mecfeedmcp/issues/1)). The MCP tool surface and feed publishers are empty. Scope history: [mecmcp#424](https://github.com/mechubsec/mecmcp/issues/424). Work is tracked in this repo's issues.
+**Under construction — not usable.** P0 (workspace, CI, and release pipeline, [#1](https://github.com/mechubsec/mecfeedmcp/issues/1)) is on `main`. `mecfeedmcp-core` admits indicators, versions snapshots, and renders feed documents ([#2](https://github.com/mechubsec/mecfeedmcp/issues/2)). The MCP tool surface and the feed server are still empty. Scope history: [mecmcp#424](https://github.com/mechubsec/mecmcp/issues/424). Work is tracked in this repo's issues.
 
 ## License
 
