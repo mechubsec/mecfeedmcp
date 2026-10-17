@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::model::Proposal;
 use crate::policy::{FeedIndicator, Policy, admit, screen_all};
+use crate::range::IndicatorKind;
 use crate::render::{FeedFormat, RenderError, render_feed};
 
 /// Why a version operation failed.
@@ -238,16 +239,24 @@ impl FeedVersions {
         Ok(SweepOutcome::Published { number })
     }
 
-    /// Render the latest snapshot. Fails closed if any entry is no longer acceptable.
+    /// Render one format-and-kind document from the latest snapshot.
+    ///
+    /// Fails closed if any live entry is no longer acceptable.
     ///
     /// # Errors
     ///
-    /// Returns [`RenderError`] when there is no snapshot or an entry fails screening.
-    pub fn render(&self, format: FeedFormat, now: i64) -> Result<String, RenderError> {
+    /// Returns [`RenderError`] when there is no snapshot, the format has no
+    /// document for `kind`, or an entry fails screening.
+    pub fn render(
+        &self,
+        format: FeedFormat,
+        kind: IndicatorKind,
+        now: i64,
+    ) -> Result<String, RenderError> {
         let Some(latest) = self.latest() else {
             return Err(RenderError::Empty);
         };
-        render_feed(format, latest.entries(), &self.policy, now)
+        render_feed(format, kind, latest.entries(), &self.policy, now)
     }
 
     fn push(&mut self, entries: Vec<FeedIndicator>) -> &Snapshot {

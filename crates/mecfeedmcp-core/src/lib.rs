@@ -10,6 +10,7 @@ mod model;
 mod policy;
 mod range;
 mod render;
+mod two_label_public_suffixes;
 mod version;
 
 pub use model::{Proposal, ProposedEntry};

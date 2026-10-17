@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use crate::model::{Proposal, ProposedEntry};
 use crate::policy::{AdmitError, EntryError, FeedIndicator, Limits, Policy, PolicyError};
 use crate::range::IndicatorKind;
-use crate::render::{FeedFormat, render_feed};
+use crate::render::{FeedFormat, RenderError, render_feed};
 use crate::version::{FeedVersions, SweepOutcome, VersionError, canonical_content};
 
 const NOW: i64 = 1_700_000_000;
@@ -208,10 +208,33 @@ fn forbidden_indicators_never_reach_a_rendered_feed() {
         FeedFormat::FortigateThreatFeed,
         FeedFormat::OpnsenseUrlTable,
     ] {
-        let text = feed.render(format, NOW).expect("render");
-        assert!(text.contains("1.1.1.1"), "{format:?}");
-        for (_, value) in forbidden {
-            assert!(!text.contains(value), "{format:?} contained {value}");
+        for kind in [
+            IndicatorKind::Ip,
+            IndicatorKind::Cidr,
+            IndicatorKind::Domain,
+        ] {
+            match feed.render(format, kind, NOW) {
+                Ok(text) => {
+                    if kind == IndicatorKind::Ip {
+                        assert!(text.contains("1.1.1.1"), "{format:?} {kind:?}");
+                    }
+                    for (_, value) in forbidden {
+                        assert!(
+                            !text.contains(value),
+                            "{format:?} {kind:?} contained {value}"
+                        );
+                    }
+                    assert!(
+                        !text.contains("blocked.example") || kind == IndicatorKind::Domain,
+                        "{format:?} {kind:?} mixed kinds"
+                    );
+                }
+                Err(RenderError::UnsupportedKind { .. }) => {
+                    assert_eq!(format, FeedFormat::JunosDynamicAddress);
+                    assert_eq!(kind, IndicatorKind::Domain);
+                }
+                Err(err) => panic!("{format:?} {kind:?}: {err}"),
+            }
         }
     }
 }
@@ -357,6 +380,44 @@ fn address_lookalikes_are_not_admitted_as_domains() {
 }
 
 #[test]
+fn two_label_public_suffixes_are_sorted_and_unique() {
+    let list = crate::two_label_public_suffixes::TWO_LABEL_PUBLIC_SUFFIXES;
+    assert!(list.windows(2).all(|pair| pair[0] < pair[1]));
+    for suffix in ["co.uk", "com.au", "github.io", "ac.uk"] {
+        assert!(list.binary_search(&suffix).is_ok(), "{suffix}");
+    }
+}
+
+#[test]
+fn public_suffix_names_need_an_extra_label() {
+    let mut feed = FeedVersions::open(empty_policy());
+    for value in [
+        "co.uk",
+        "evil.co.uk",
+        "github.io",
+        "pages.github.io",
+        "com.au",
+        "shop.com.au",
+    ] {
+        let err = publish_one(&mut feed, IndicatorKind::Domain, value).expect_err(value);
+        assert!(
+            matches!(
+                err,
+                VersionError::Admit(AdmitError::Entry {
+                    reason: EntryError::BroadDomain,
+                    ..
+                })
+            ),
+            "{value}: {err:?}"
+        );
+    }
+    publish_one(&mut feed, IndicatorKind::Domain, "malware.evil.co.uk").expect("co.uk extra");
+    publish_one(&mut feed, IndicatorKind::Domain, "evil.pages.github.io").expect("github.io extra");
+    publish_one(&mut feed, IndicatorKind::Domain, "blocked.example").expect("single-label tld");
+    publish_one(&mut feed, IndicatorKind::Domain, "malware.example.com").expect("com extra");
+}
+
+#[test]
 fn publish_drops_expired_rows_and_rescreens_live_rows() {
     let mut feed = FeedVersions::open(empty_policy());
     let mut short = entry(IndicatorKind::Ip, "1.0.0.1");
@@ -469,6 +530,21 @@ mod props {
                 "{value}"
             );
         }
+
+        #[test]
+        fn three_label_public_suffix_names_never_reach_a_feed(
+            label in "[a-z][a-z0-9-]{0,10}[a-z0-9]",
+            pick in 0usize..3,
+        ) {
+            prop_assume!(!label.contains("--") && !label.ends_with('-'));
+            let suffix = ["co.uk", "github.io", "com.au"][pick];
+            let value = format!("{label}.{suffix}");
+            let mut feed = FeedVersions::open(empty_policy());
+            prop_assert!(
+                publish_one(&mut feed, IndicatorKind::Domain, &value).is_err(),
+                "{value}"
+            );
+        }
     }
 
     fn blocked_v4_prefix(pick: usize, host: u8, len: u8) -> String {
@@ -519,10 +595,15 @@ fn expiry_sweep_publishes_a_new_version_and_render_waits_for_it() {
         NOW,
     )
     .expect("publish");
-    assert!(feed.render(FeedFormat::PanosEdl, NOW + 11).is_err());
+    assert!(
+        feed.render(FeedFormat::PanosEdl, IndicatorKind::Ip, NOW + 11)
+            .is_err()
+    );
     let outcome = feed.sweep_expired(NOW + 11).expect("sweep");
     assert_eq!(outcome, SweepOutcome::Published { number: 2 });
-    let text = feed.render(FeedFormat::PanosEdl, NOW + 11).expect("render");
+    let text = feed
+        .render(FeedFormat::PanosEdl, IndicatorKind::Ip, NOW + 11)
+        .expect("render");
     assert_eq!(text, "1.1.1.1\n");
     assert_eq!(
         feed.sweep_expired(NOW + 11).expect("unchanged"),
@@ -535,19 +616,29 @@ fn render_fails_closed_when_policy_later_allowlists_an_entry() {
     let mut feed = FeedVersions::open(empty_policy());
     publish_one(&mut feed, IndicatorKind::Ip, "1.1.1.1").expect("publish");
     feed.update_policy(policy(&[], &["1.1.1.1/32"], &[], Limits::default()));
-    assert!(feed.render(FeedFormat::FortigateThreatFeed, NOW).is_err());
+    assert!(
+        feed.render(FeedFormat::FortigateThreatFeed, IndicatorKind::Ip, NOW)
+            .is_err()
+    );
 }
 
 #[test]
 fn forged_reserved_indicator_cannot_be_rendered() {
     let forged = FeedIndicator::forge(IndicatorKind::Ip, "10.1.1.1", NOW + WEEK, false);
-    let err =
-        render_feed(FeedFormat::PanosEdl, &[forged], &empty_policy(), NOW).expect_err("reserved");
+    let err = render_feed(
+        FeedFormat::PanosEdl,
+        IndicatorKind::Ip,
+        &[forged],
+        &empty_policy(),
+        NOW,
+    )
+    .expect_err("reserved");
     assert!(matches!(err, crate::render::RenderError::Rejected { .. }));
 
     let public = FeedIndicator::forge(IndicatorKind::Ip, "1.1.1.1", NOW + WEEK, false);
     let text = render_feed(
         FeedFormat::OpnsenseUrlTable,
+        IndicatorKind::Ip,
         &[public],
         &empty_policy(),
         NOW,
@@ -580,31 +671,73 @@ fn golden_documents_and_digest_are_stable() {
         sha256_hex(preimage.as_bytes())
     );
 
-    assert_eq!(
-        feed.render(FeedFormat::PanosEdl, NOW).expect("panos"),
-        include_str!("../tests/fixtures/panos_edl.txt")
-    );
-    assert_eq!(
-        feed.render(FeedFormat::FortigateThreatFeed, NOW)
-            .expect("fortigate"),
-        include_str!("../tests/fixtures/fortigate_threat.txt")
-    );
-    assert_eq!(
-        feed.render(FeedFormat::OpnsenseUrlTable, NOW)
-            .expect("opnsense"),
-        include_str!("../tests/fixtures/opnsense_url_table.txt")
-    );
-    assert_eq!(
-        feed.render(FeedFormat::JunosDynamicAddress, NOW)
-            .expect("junos"),
-        include_str!("../tests/fixtures/junos_dynamic_address.txt")
-    );
-    assert!(
-        !feed
-            .render(FeedFormat::JunosDynamicAddress, NOW)
-            .expect("junos")
-            .contains("blocked.example")
-    );
+    for (format, kind, fixture) in [
+        (
+            FeedFormat::PanosEdl,
+            IndicatorKind::Ip,
+            include_str!("../tests/fixtures/panos_edl_ip.txt"),
+        ),
+        (
+            FeedFormat::PanosEdl,
+            IndicatorKind::Cidr,
+            include_str!("../tests/fixtures/panos_edl_cidr.txt"),
+        ),
+        (
+            FeedFormat::PanosEdl,
+            IndicatorKind::Domain,
+            include_str!("../tests/fixtures/panos_edl_domain.txt"),
+        ),
+        (
+            FeedFormat::FortigateThreatFeed,
+            IndicatorKind::Ip,
+            include_str!("../tests/fixtures/fortigate_threat_ip.txt"),
+        ),
+        (
+            FeedFormat::FortigateThreatFeed,
+            IndicatorKind::Cidr,
+            include_str!("../tests/fixtures/fortigate_threat_cidr.txt"),
+        ),
+        (
+            FeedFormat::FortigateThreatFeed,
+            IndicatorKind::Domain,
+            include_str!("../tests/fixtures/fortigate_threat_domain.txt"),
+        ),
+        (
+            FeedFormat::OpnsenseUrlTable,
+            IndicatorKind::Ip,
+            include_str!("../tests/fixtures/opnsense_url_table_ip.txt"),
+        ),
+        (
+            FeedFormat::OpnsenseUrlTable,
+            IndicatorKind::Cidr,
+            include_str!("../tests/fixtures/opnsense_url_table_cidr.txt"),
+        ),
+        (
+            FeedFormat::OpnsenseUrlTable,
+            IndicatorKind::Domain,
+            include_str!("../tests/fixtures/opnsense_url_table_domain.txt"),
+        ),
+        (
+            FeedFormat::JunosDynamicAddress,
+            IndicatorKind::Ip,
+            include_str!("../tests/fixtures/junos_dynamic_address_ip.txt"),
+        ),
+        (
+            FeedFormat::JunosDynamicAddress,
+            IndicatorKind::Cidr,
+            include_str!("../tests/fixtures/junos_dynamic_address_cidr.txt"),
+        ),
+    ] {
+        assert_eq!(
+            feed.render(format, kind, NOW).expect("render"),
+            fixture,
+            "{format:?} {kind:?}"
+        );
+    }
+    let err = feed
+        .render(FeedFormat::JunosDynamicAddress, IndicatorKind::Domain, NOW)
+        .expect_err("junos domain");
+    assert!(matches!(err, RenderError::UnsupportedKind { .. }));
 }
 
 #[test]
