@@ -1,0 +1,58 @@
+[Unit]
+Description=mecfeed-serve read-only TLS feed server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mecfeed-serve
+Group=mecfeed-serve
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/mecfeed-serve \
+    --listen 0.0.0.0:8443 \
+    --tls-cert /etc/mecfeed-serve/tls.crt \
+    --tls-key /etc/mecfeed-serve/tls.key \
+    --snapshot-dir /var/lib/mecfeed-serve/snapshots
+Restart=always
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0077
+StateDirectory=mecfeed-serve
+StateDirectoryMode=0700
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/mecfeed-serve
+ReadWritePaths=/var/lib/mecfeed-serve
+PrivateTmp=true
+PrivateDevices=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressAllow=localhost
+IPAddressDeny=169.254.0.0/16 fe80::/10 fd00:ec2::254/128
+IPAccounting=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @obsolete @mount @swap @reboot @module
+SystemCallErrorNumber=EPERM
+TasksMax=256
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

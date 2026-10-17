@@ -1,0 +1,61 @@
+name: Security
+
+on:
+  # Scoped to main for the same reason as ci.yml: a bare `push:` doubled every
+  # PR-branch run against the `pull_request` event without the concurrency
+  # group collapsing them.
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Secret scan: the shared mechubsec workflow (pinned gitleaks binary; no
+  # license needed, unlike gitleaks-action on org repos).
+  secrets:
+    uses: mechubsec/.github/.github/workflows/gitleaks.yml@1f46f69afab3cc1c77efa196747bc3a5e45a3755
+    with:
+      full-history: true
+
+  dependencies:
+    name: Rust dependency policy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
+      - name: Install cargo-audit 0.22.2
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit advisories
+        run: cargo audit --deny warnings
+      - name: Install cargo-deny 0.20.2
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: Check advisories, licenses, bans, and sources
+        run: cargo deny check advisories licenses bans sources
+      - name: Self-check -- advisories check must fail on a known-vulnerable dependency
+        # This is not exercising the workspace: it is proving the check above
+        # is not a no-op. `tests/fixtures/deny-known-advisory` pins time 0.1.45
+        # (RUSTSEC-2020-0071) in a standalone crate that is deliberately
+        # excluded from the workspace, so this regresses loudly if `cargo deny`
+        # is ever pointed at the wrong manifest or its advisories DB goes stale.
+        run: |
+          if cargo deny --manifest-path tests/fixtures/deny-known-advisory/Cargo.toml check advisories; then
+            echo "FAIL: cargo deny check advisories passed on a fixture with a known RUSTSEC advisory (RUSTSEC-2020-0071)"
+            exit 1
+          fi
+          echo "PASS: cargo deny check advisories correctly rejected the known-vulnerable fixture"
+
+  trivy:
+    name: Trivy filesystem scan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.1.0
+        with:
+          version: v0.70.0
+      - run: trivy fs --scanners vuln,misconfig,secret --exit-code 1 .

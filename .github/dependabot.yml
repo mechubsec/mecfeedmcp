@@ -1,0 +1,34 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+    open-pull-requests-limit: 5
+    # The mecmcp crates are pinned by git tag and moved by hand in a
+    # chore/mecmcp-<version> PR. Dependabot advances the git ref past the tag,
+    # which cargo then refuses ("failed to select a version for the requirement
+    # mecmcp-server = ^0.23.1"), failing the whole cargo run and taking
+    # unrelated crate updates down with it.
+    ignore:
+      - dependency-name: mecmcp-*
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github_actions-minor-patch:
+        update-types: ["minor", "patch"]
+    open-pull-requests-limit: 5
+    ignore:
+      - dependency-name: dtolnay/rust-toolchain
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      docker-minor-patch:
+        update-types: ["minor", "patch"]

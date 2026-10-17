@@ -1,0 +1,4 @@
+title = "mecfeedmcp gitleaks config"
+
+[extend]
+path = ".gitleaks-vendor.toml"

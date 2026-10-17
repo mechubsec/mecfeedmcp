@@ -1,3 +1,22 @@
 /target
+/.worktrees/
+/dist/
 **/*.rs.bk
+
+# Never commit real authentication material, even hashed.
+tokens.json
+*.tokens.json
+!crates/*/tests/fixtures/*-tokens.json
+
+.env
+*.pem
+*.key
+!crates/*/tests/fixtures/*.pem
+
 .DS_Store
+
+test.log
+*.log
+.gstack/
+.review-codex/
+__pycache__/

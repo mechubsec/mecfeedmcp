@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "tenant": "lab",
+  "changeset_state_file": "/var/lib/mecfeedmcp/changeset-state.json",
+  "approval_ttl_secs": 3600
+}

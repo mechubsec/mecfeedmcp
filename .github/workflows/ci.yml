@@ -1,0 +1,236 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Build, lint, and test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@b4f984c1e7daae8e175614de3e73a8411a20333c # 1.89.0
+      - run: cargo +1.89 check --workspace --all-targets --locked
+
+  docker-build:
+    name: Docker image build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Build MCP image
+        run: docker build --tag mecfeedmcp:ci .
+      - name: Build feed-server image
+        run: docker build --file Dockerfile.serve --tag mecfeed-serve:ci .
+      - name: Verify config paths survive operator overrides
+        run: |
+          container_id=$(docker create mecfeedmcp:ci --host 0.0.0.0)
+          argv=$(docker inspect "$container_id" --format '{{join .Args "\n"}}')
+          docker rm "$container_id" > /dev/null
+
+          echo "$argv" | grep -q -- '/etc/mecfeedmcp/feed.json' || { echo "FAIL: --device-mapping path missing from argv with --host override"; exit 1; }
+          echo "$argv" | grep -q -- '/var/lib/mecfeedmcp/tokens.json' || { echo "FAIL: --tokens-file path missing from argv with --host override"; exit 1; }
+          echo "$argv" | grep -q -- '/var/lib/mecfeedmcp/audit-hmac.key' || { echo "FAIL: --audit-hmac-key-file path missing from argv with --host override"; exit 1; }
+          echo "PASS: config paths survive --host override"
+      - name: Verify feed-server TLS paths survive --listen override
+        run: |
+          container_id=$(docker create mecfeed-serve:ci --listen 0.0.0.0:9443)
+          argv=$(docker inspect "$container_id" --format '{{join .Args "\n"}}')
+          docker rm "$container_id" > /dev/null
+          echo "$argv" | grep -q -- '/etc/mecfeed-serve/tls.crt' || { echo "FAIL: --tls-cert missing from argv"; exit 1; }
+          echo "$argv" | grep -q -- '/etc/mecfeed-serve/tls.key' || { echo "FAIL: --tls-key missing from argv"; exit 1; }
+          echo "$argv" | grep -q -- '/var/lib/mecfeed-serve/snapshots' || { echo "FAIL: --snapshot-dir missing from argv"; exit 1; }
+          echo "PASS: feed-server TLS paths survive --listen override"
+      - name: Verify the audit HMAC key is generated on first run
+        run: |
+          state_dir=$(mktemp -d)
+          etc_dir=$(mktemp -d)
+          cp examples/feed.example.json "$etc_dir/feed.json"
+          echo '{"version":1,"tokens":[]}' > "$state_dir/tokens.json"
+          chmod 0640 "$etc_dir/feed.json"
+          chmod 0600 "$state_dir/tokens.json"
+          chmod 0750 "$etc_dir"
+          chmod 0700 "$state_dir"
+          sudo chown -R 65532:65532 "$state_dir" "$etc_dir"
+          docker run --rm \
+            -v "$etc_dir:/etc/mecfeedmcp:ro" \
+            -v "$state_dir:/var/lib/mecfeedmcp" \
+            --user 65532:65532 \
+            mecfeedmcp:ci --transport stdio --allow-no-auth || true
+          sudo test -s "$state_dir/audit-hmac.key" || { echo "FAIL: audit-hmac.key was not generated"; exit 1; }
+          echo "PASS: audit-hmac.key generated on first run"
+
+  packaging:
+    name: Package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - id: source
+        name: Record exact source commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends shellcheck
+      - name: Install Trivy 0.70.0
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.70.0
+      - name: Shellcheck packaging scripts
+        run: shellcheck scripts/build-package.sh scripts/verify-packaging.sh packaging/lxc/install.sh packaging/tests/package-smoke.sh
+      - name: Verify packaging policy
+        run: scripts/verify-packaging.sh
+      - name: Build package
+        run: scripts/build-package.sh
+      - name: Smoke test package
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          artifact_dir="dist/$SOURCE_SHA"
+          mapfile -t archives < <(find "$artifact_dir" -maxdepth 1 -type f -name 'mecfeedmcp_*_amd64.tar.gz' -print)
+          test "${#archives[@]}" -eq 1
+          archive="${archives[0]}"
+          test -f "${archive}.sha256"
+          test ! -L "$archive"
+          test ! -L "${archive}.sha256"
+          mapfile -t artifact_entries < <(find -P "$artifact_dir" -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' | LC_ALL=C sort)
+          test "${#artifact_entries[@]}" -eq 2
+          test "${artifact_entries[0]}" = "$(basename -- "$archive")"$'\t'f
+          test "${artifact_entries[1]}" = "$(basename -- "${archive}.sha256")"$'\t'f
+          packaging/tests/package-smoke.sh "$archive"
+      - name: Verify package metadata and SBOM
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          artifact_dir="dist/$SOURCE_SHA"
+          mapfile -t archives < <(find "$artifact_dir" -maxdepth 1 -type f -name 'mecfeedmcp_*_amd64.tar.gz' -print)
+          test "${#archives[@]}" -eq 1
+          archive="${archives[0]}"
+          mapfile -t build_infos < <(tar -tzf "$archive" | grep -E '/BUILD-INFO$')
+          test "${#build_infos[@]}" -eq 1
+          build_info="$(tar -xOf "$archive" "${build_infos[0]}")"
+          printf '%s\n' "$build_info" | grep -Fx 'release_status=release'
+          printf '%s\n' "$build_info" | grep -Fx "git_commit=$SOURCE_SHA"
+          printf '%s\n' "$build_info" | awk -F= -v expected='mecmcp_ref=v0.28.1' '$1 == "mecmcp_ref" { count += 1; matches += ($0 == expected) } END { exit !(count == 1 && matches == 1) }'
+          printf '%s\n' "$build_info" | grep -E '^glibc_floor=[0-9]+(\.[0-9]+)+$'
+          mapfile -t sboms < <(tar -tzf "$archive" | grep -E '/SBOM\.cdx\.json$')
+          test "${#sboms[@]}" -eq 1
+          tar -xOf "$archive" "${sboms[0]}" | jq -e '
+            .bomFormat == "CycloneDX"
+            and (.metadata.component.name == "mecfeedmcp")
+            and (.components | type == "array" and length > 0)
+            and any(.components[]; .name == "serde")
+            and (
+              ([
+                .components[]
+                | select(.name? | strings | startswith("mecmcp-"))
+                | [.name, .version]
+              ] | sort)
+              == [
+                ["mecmcp-audit", "0.28.1"],
+                ["mecmcp-auth", "0.28.1"],
+                ["mecmcp-changeset", "0.28.1"],
+                ["mecmcp-redact", "0.28.1"],
+                ["mecmcp-runtime", "0.28.1"],
+                ["mecmcp-secret", "0.28.1"],
+                ["mecmcp-server", "0.28.1"],
+                ["mecmcp-transport", "0.28.1"]
+              ]
+            )
+            and (tostring | contains("v0.8.0") | not)
+            and (tostring | contains("70ac3d8fb5f27db3257d11aef28bd09587f085e1") | not)
+          ' >/dev/null
+          ! tar -xOf "$archive" "${sboms[0]}" | grep -Fq "$GITHUB_WORKSPACE"
+          ! tar -xOf "$archive" "${sboms[0]}" | grep -Eq '"/(home|workspace|workspaces)/'
+      - name: Verify exact upload artifact set
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          artifact_dir="dist/$SOURCE_SHA"
+          mapfile -t archives < <(find "$artifact_dir" -maxdepth 1 -type f -name 'mecfeedmcp_*_amd64.tar.gz' -print)
+          test "${#archives[@]}" -eq 1
+          archive="${archives[0]}"
+          test -f "${archive}.sha256"
+          test ! -L "$archive"
+          test ! -L "${archive}.sha256"
+          mapfile -t artifact_entries < <(find -P "$artifact_dir" -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' | LC_ALL=C sort)
+          test "${#artifact_entries[@]}" -eq 2
+          test "${artifact_entries[0]}" = "$(basename -- "$archive")"$'\t'f
+          test "${artifact_entries[1]}" = "$(basename -- "${archive}.sha256")"$'\t'f
+      - name: Upload package
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mecfeedmcp-${{ steps.source.outputs.sha }}
+          path: dist/${{ steps.source.outputs.sha }}/*
+          if-no-files-found: error
+      - name: Verify skip-build provenance stays honest
+        run: packaging/tests/skip-build-provenance.sh
+
+  conformance:
+    name: Package conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
+      - name: Install jq and realpath
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends jq coreutils
+      - name: Install Trivy 0.70.0
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.70.0
+      - name: Build package
+        run: scripts/build-package.sh
+      - name: Stage the package
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse HEAD)
+          mapfile -t archives < <(find "dist/$commit" -maxdepth 1 -type f -name 'mecfeedmcp_*_amd64.tar.gz')
+          test "${#archives[@]}" -eq 1
+          mkdir -p staging
+          tar -xzf "${archives[0]}" -C staging --strip-components=1
+          cp packaging/conformance.toml staging/
+      - name: Build image
+        run: docker build --tag mecfeedmcp:ci .
+      - name: Conformance
+        uses: mechubsec/mecmcp/packaging/conformance@db9e2ea9d1a1ed7e7a962a236e579ad62bb24435 # v0.28.1
+        with:
+          staging: staging
+          manifest: staging/conformance.toml
+          image: mecfeedmcp:ci

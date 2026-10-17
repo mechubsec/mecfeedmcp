@@ -62,7 +62,7 @@ Only what is strictly necessary lives elsewhere:
 
 ## Status
 
-**Planned — scope agreed, engineering not started.** Scope history: [mecmcp#424](https://github.com/mechubsec/mecmcp/issues/424). Work is tracked in this repo's issues.
+**Under construction — not usable.** P0 is the workspace, CI and release pipeline ([#1](https://github.com/mechubsec/mecfeedmcp/issues/1)). The MCP tool surface and feed publishers are empty. Scope history: [mecmcp#424](https://github.com/mechubsec/mecmcp/issues/424). Work is tracked in this repo's issues.
 
 ## License
 

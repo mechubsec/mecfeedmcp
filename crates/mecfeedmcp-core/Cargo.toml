@@ -1,0 +1,17 @@
+[package]
+name = "mecfeedmcp-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Indicator model and fail-closed validators for mecfeedmcp"
+publish = false
+
+[dependencies]
+ipnet.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
