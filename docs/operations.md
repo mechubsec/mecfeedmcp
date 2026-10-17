@@ -31,6 +31,11 @@ The MCP image's `ENTRYPOINT` keeps `--device-mapping`, `--tokens-file`, and
 `--audit-format json` is the correct audit sink in a container (there is no
 journald socket).
 
+`mecfeed-serve` matches its client allowlist against the TCP peer address.
+Behind Docker NAT that address is the bridge gateway, so the default
+loopback-only allowlist rejects every client. Use host networking, or pass
+`--allow-cidr` with the firewall addresses that should pull snapshots.
+
 ## Tokens and audit
 
 Match the rest of the mecmcp fleet: bearer tokens in
