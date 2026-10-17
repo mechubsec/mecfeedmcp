@@ -5,12 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Indicator model and fail-closed validators for mecfeedmcp"
+description = "Indicator admission, feed versions, and vendor renderers for mecfeedmcp"
 publish = false
 
 [dependencies]
 ipnet.workspace = true
 serde.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 
 [lints]

@@ -1,0 +1,436 @@
+use ipnet::IpNet;
+use sha2::{Digest, Sha256};
+
+use crate::model::{Proposal, ProposedEntry};
+use crate::policy::{AdmitError, EntryError, FeedIndicator, Limits, Policy, PolicyError};
+use crate::range::IndicatorKind;
+use crate::render::{FeedFormat, render_feed};
+use crate::version::{FeedVersions, SweepOutcome, VersionError, canonical_content};
+
+const NOW: i64 = 1_700_000_000;
+const WEEK: i64 = 7 * 24 * 60 * 60;
+
+fn net(value: &str) -> IpNet {
+    value.parse().expect(value)
+}
+
+fn limits_broad() -> Limits {
+    Limits {
+        permit_explicit_broad: true,
+        ..Limits::default()
+    }
+}
+
+fn policy(own: &[&str], allow: &[&str], suffixes: &[&str], limits: Limits) -> Policy {
+    Policy::try_new(
+        own.iter().copied().map(net).collect(),
+        allow.iter().copied().map(net).collect(),
+        suffixes.iter().copied(),
+        limits,
+    )
+    .expect("policy")
+}
+
+fn empty_policy() -> Policy {
+    policy(&[], &[], &[], Limits::default())
+}
+
+fn entry(kind: IndicatorKind, value: &str) -> ProposedEntry {
+    ProposedEntry {
+        kind,
+        value: value.to_string(),
+        source: "lab".to_string(),
+        confidence: 50,
+        first_seen: NOW,
+        last_seen: NOW,
+        expires_at: Some(NOW + WEEK),
+        allow_broad_prefix: false,
+    }
+}
+
+fn proposal(entries: Vec<ProposedEntry>) -> Proposal {
+    Proposal { entries }
+}
+
+fn publish_one(
+    feed: &mut FeedVersions,
+    kind: IndicatorKind,
+    value: &str,
+) -> Result<(), VersionError> {
+    feed.publish(&proposal(vec![entry(kind, value)]), NOW)
+        .map(|_| ())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+#[test]
+fn version_is_nonempty() {
+    assert!(!crate::version().is_empty());
+}
+
+#[test]
+fn default_limits_match_the_phase_contract() {
+    let limits = Limits::default();
+    assert_eq!(limits.max_entries, 100);
+    assert_eq!(limits.default_ttl_secs, WEEK);
+    assert_eq!(limits.max_ttl_secs, 30 * 24 * 60 * 60);
+    assert_eq!(limits.min_ipv4_prefix, 24);
+    assert_eq!(limits.min_ipv6_prefix, 48);
+    assert!(!limits.permit_explicit_broad);
+}
+
+#[test]
+fn invalid_policy_is_rejected() {
+    let err = Policy::try_new(vec![], vec![], ["com"], Limits::default()).expect_err("suffix");
+    assert_eq!(err, PolicyError::Suffix);
+    let err = Policy::try_new(
+        vec![],
+        vec![],
+        Vec::<&str>::new(),
+        Limits {
+            max_entries: 0,
+            ..Limits::default()
+        },
+    )
+    .expect_err("cap");
+    assert_eq!(err, PolicyError::EntryCap);
+    let err = Policy::try_new(
+        vec![],
+        vec![],
+        Vec::<&str>::new(),
+        Limits {
+            min_ipv4_prefix: 16,
+            ..Limits::default()
+        },
+    )
+    .expect_err("prefix");
+    assert_eq!(err, PolicyError::PrefixMinimum);
+}
+
+#[test]
+fn omitted_expiry_defaults_to_seven_days_and_thirty_is_the_max() {
+    let mut feed = FeedVersions::open(empty_policy());
+    let mut proposed = entry(IndicatorKind::Ip, "1.1.1.1");
+    proposed.expires_at = None;
+    feed.publish(&proposal(vec![proposed]), NOW)
+        .expect("default ttl");
+    assert_eq!(
+        feed.latest().expect("snap").entries()[0].expires_at(),
+        NOW + WEEK
+    );
+
+    let mut too_long = entry(IndicatorKind::Ip, "1.0.0.1");
+    too_long.expires_at = Some(NOW + 30 * 24 * 60 * 60 + 1);
+    let err = feed
+        .publish(&proposal(vec![too_long]), NOW)
+        .expect_err("max ttl");
+    assert!(matches!(
+        err,
+        VersionError::Admit(AdmitError::Entry {
+            reason: EntryError::Ttl { .. },
+            ..
+        })
+    ));
+    assert_eq!(feed.latest().expect("snap").entries().len(), 1);
+}
+
+#[test]
+fn forbidden_indicators_never_reach_a_rendered_feed() {
+    let mut feed = FeedVersions::open(policy(
+        &["8.8.8.0/24", "2606:4700:4700::/48"],
+        &["9.9.9.0/24"],
+        &["partner.test"],
+        Limits::default(),
+    ));
+    let forbidden = [
+        (IndicatorKind::Ip, "10.0.0.1"),
+        (IndicatorKind::Ip, "192.168.1.1"),
+        (IndicatorKind::Ip, "172.16.0.4"),
+        (IndicatorKind::Ip, "127.0.0.1"),
+        (IndicatorKind::Ip, "100.64.0.1"),
+        (IndicatorKind::Ip, "169.254.1.1"),
+        (IndicatorKind::Ip, "192.0.2.1"),
+        (IndicatorKind::Ip, "198.51.100.1"),
+        (IndicatorKind::Ip, "203.0.113.10"),
+        (IndicatorKind::Ip, "224.0.0.1"),
+        (IndicatorKind::Ip, "240.0.0.1"),
+        (IndicatorKind::Ip, "255.255.255.255"),
+        (IndicatorKind::Ip, "::"),
+        (IndicatorKind::Ip, "::1"),
+        (IndicatorKind::Ip, "fc00::1"),
+        (IndicatorKind::Ip, "fe80::1"),
+        (IndicatorKind::Ip, "ff02::1"),
+        (IndicatorKind::Ip, "::ffff:8.8.8.8"),
+        (IndicatorKind::Ip, "8.8.8.8"),
+        (IndicatorKind::Ip, "9.9.9.9"),
+        (IndicatorKind::Ip, "2606:4700:4700::1111"),
+        (IndicatorKind::Cidr, "10.1.0.0/16"),
+        (IndicatorKind::Cidr, "8.8.8.0/24"),
+        (IndicatorKind::Cidr, "9.9.9.0/24"),
+        (IndicatorKind::Cidr, "1.2.0.0/16"),
+        (IndicatorKind::Domain, "partner.test"),
+        (IndicatorKind::Domain, "a.partner.test"),
+        (IndicatorKind::Domain, "A.Partner.TEST"),
+    ];
+    for (kind, value) in forbidden {
+        assert!(publish_one(&mut feed, kind, value).is_err(), "{value}");
+    }
+    assert!(feed.latest().is_none());
+
+    let mixed = proposal(vec![
+        entry(IndicatorKind::Ip, "1.1.1.1"),
+        entry(IndicatorKind::Ip, "10.0.0.1"),
+    ]);
+    assert!(feed.publish(&mixed, NOW).is_err());
+    assert!(feed.latest().is_none());
+
+    feed.publish(
+        &proposal(vec![
+            entry(IndicatorKind::Ip, "1.1.1.1"),
+            entry(IndicatorKind::Domain, "blocked.example"),
+        ]),
+        NOW,
+    )
+    .expect("admit");
+
+    for format in [
+        FeedFormat::PanosEdl,
+        FeedFormat::JunosDynamicAddress,
+        FeedFormat::FortigateThreatFeed,
+        FeedFormat::OpnsenseUrlTable,
+    ] {
+        let text = feed.render(format, NOW).expect("render");
+        assert!(text.contains("1.1.1.1"), "{format:?}");
+        for (_, value) in forbidden {
+            assert!(!text.contains(value), "{format:?} contained {value}");
+        }
+    }
+}
+
+#[test]
+fn explicit_broad_prefix_stops_at_the_hard_floor() {
+    let mut strict = FeedVersions::open(empty_policy());
+    assert!(publish_one(&mut strict, IndicatorKind::Cidr, "8.0.0.0/8").is_err());
+
+    let mut allowed = FeedVersions::open(policy(&[], &[], &[], limits_broad()));
+    let mut broad = entry(IndicatorKind::Cidr, "8.0.0.0/8");
+    broad.allow_broad_prefix = true;
+    allowed
+        .publish(&proposal(vec![broad]), NOW)
+        .expect("explicit");
+    assert_eq!(
+        allowed.latest().expect("snap").entries()[0].value(),
+        "8.0.0.0/8"
+    );
+
+    let mut still_broad = entry(IndicatorKind::Cidr, "8.0.0.0/7");
+    still_broad.allow_broad_prefix = true;
+    assert!(allowed.publish(&proposal(vec![still_broad]), NOW).is_err());
+}
+
+#[test]
+fn duplicate_live_entry_is_rejected_and_expired_entry_can_be_replaced() {
+    let mut feed = FeedVersions::open(empty_policy());
+    publish_one(&mut feed, IndicatorKind::Ip, "1.1.1.1").expect("first");
+    assert!(publish_one(&mut feed, IndicatorKind::Ip, "1.1.1.1").is_err());
+    assert_eq!(feed.latest().expect("snap").manifest().number(), 1);
+
+    let mut short = entry(IndicatorKind::Ip, "1.0.0.1");
+    short.expires_at = Some(NOW + 10);
+    feed.publish(&proposal(vec![short]), NOW).expect("short");
+    let later = NOW + 11;
+    let mut renewed = entry(IndicatorKind::Ip, "1.0.0.1");
+    renewed.first_seen = later;
+    renewed.last_seen = later;
+    renewed.expires_at = Some(later + WEEK);
+    feed.publish(&proposal(vec![renewed]), later)
+        .expect("replace");
+    let values: Vec<_> = feed
+        .latest()
+        .expect("snap")
+        .entries()
+        .iter()
+        .map(|e| e.value())
+        .collect();
+    assert_eq!(
+        values.iter().filter(|value| **value == "1.0.0.1").count(),
+        1
+    );
+    assert!(
+        feed.latest()
+            .expect("snap")
+            .entries()
+            .iter()
+            .any(|e| e.value() == "1.0.0.1" && e.expires_at() == later + WEEK)
+    );
+}
+
+#[test]
+fn rollback_republishes_the_previous_snapshot_and_leaves_it_immutable() {
+    let mut feed = FeedVersions::open(empty_policy());
+    publish_one(&mut feed, IndicatorKind::Ip, "1.1.1.1").expect("v1");
+    let v1_digest = feed
+        .latest()
+        .expect("v1")
+        .manifest()
+        .content_digest()
+        .to_string();
+    publish_one(&mut feed, IndicatorKind::Ip, "1.0.0.1").expect("v2");
+    feed.rollback().expect("rollback");
+    assert_eq!(feed.latest().expect("v3").manifest().number(), 3);
+    assert_eq!(feed.latest().expect("v3").manifest().parent(), Some(2));
+    assert_eq!(
+        feed.latest().expect("v3").manifest().content_digest(),
+        v1_digest
+    );
+    assert_ne!(
+        feed.latest().expect("v3").manifest().digest(),
+        feed.get(1).expect("v1").manifest().digest()
+    );
+    assert_eq!(
+        feed.get(1).expect("v1").manifest().content_digest(),
+        v1_digest
+    );
+    assert_eq!(feed.get(1).expect("v1").entries().len(), 1);
+    assert!(feed.rollback().is_ok());
+    let err = FeedVersions::open(empty_policy())
+        .rollback()
+        .expect_err("empty");
+    assert_eq!(err, VersionError::Empty);
+}
+
+#[test]
+fn expiry_sweep_publishes_a_new_version_and_render_waits_for_it() {
+    let mut feed = FeedVersions::open(empty_policy());
+    let mut short = entry(IndicatorKind::Ip, "1.0.0.1");
+    short.expires_at = Some(NOW + 10);
+    feed.publish(
+        &proposal(vec![short, entry(IndicatorKind::Ip, "1.1.1.1")]),
+        NOW,
+    )
+    .expect("publish");
+    assert!(feed.render(FeedFormat::PanosEdl, NOW + 11).is_err());
+    let outcome = feed.sweep_expired(NOW + 11).expect("sweep");
+    assert_eq!(outcome, SweepOutcome::Published { number: 2 });
+    let text = feed.render(FeedFormat::PanosEdl, NOW + 11).expect("render");
+    assert_eq!(text, "1.1.1.1\n");
+    assert_eq!(
+        feed.sweep_expired(NOW + 11).expect("unchanged"),
+        SweepOutcome::Unchanged { number: 2 }
+    );
+}
+
+#[test]
+fn render_fails_closed_when_policy_later_allowlists_an_entry() {
+    let mut feed = FeedVersions::open(empty_policy());
+    publish_one(&mut feed, IndicatorKind::Ip, "1.1.1.1").expect("publish");
+    feed.update_policy(policy(&[], &["1.1.1.1/32"], &[], Limits::default()));
+    assert!(feed.render(FeedFormat::FortigateThreatFeed, NOW).is_err());
+}
+
+#[test]
+fn forged_reserved_indicator_cannot_be_rendered() {
+    let forged = FeedIndicator::forge(IndicatorKind::Ip, "10.1.1.1", NOW + WEEK, false);
+    let err =
+        render_feed(FeedFormat::PanosEdl, &[forged], &empty_policy(), NOW).expect_err("reserved");
+    assert!(matches!(err, crate::render::RenderError::Rejected { .. }));
+
+    let public = FeedIndicator::forge(IndicatorKind::Ip, "1.1.1.1", NOW + WEEK, false);
+    let text = render_feed(
+        FeedFormat::OpnsenseUrlTable,
+        &[public],
+        &empty_policy(),
+        NOW,
+    )
+    .expect("public");
+    assert_eq!(text, "1.1.1.1\n");
+}
+
+#[test]
+fn golden_documents_and_digest_are_stable() {
+    let mut feed = FeedVersions::open(empty_policy());
+    feed.publish(
+        &proposal(vec![
+            entry(IndicatorKind::Ip, "1.1.1.1"),
+            entry(IndicatorKind::Ip, "2606:4700:4700::1111"),
+            entry(IndicatorKind::Cidr, "9.9.9.0/24"),
+            entry(IndicatorKind::Domain, "blocked.example"),
+        ]),
+        NOW,
+    )
+    .expect("publish");
+    let snapshot = feed.latest().expect("snapshot");
+    let expected = include_str!("../tests/fixtures/snapshot-content.txt");
+    assert_eq!(canonical_content(snapshot.entries()), expected);
+    let content_digest = sha256_hex(expected.as_bytes());
+    assert_eq!(snapshot.manifest().content_digest(), content_digest);
+    let preimage = format!("1\n-\n{content_digest}\n");
+    assert_eq!(
+        snapshot.manifest().digest(),
+        sha256_hex(preimage.as_bytes())
+    );
+
+    assert_eq!(
+        feed.render(FeedFormat::PanosEdl, NOW).expect("panos"),
+        include_str!("../tests/fixtures/panos_edl.txt")
+    );
+    assert_eq!(
+        feed.render(FeedFormat::FortigateThreatFeed, NOW)
+            .expect("fortigate"),
+        include_str!("../tests/fixtures/fortigate_threat.txt")
+    );
+    assert_eq!(
+        feed.render(FeedFormat::OpnsenseUrlTable, NOW)
+            .expect("opnsense"),
+        include_str!("../tests/fixtures/opnsense_url_table.txt")
+    );
+    assert_eq!(
+        feed.render(FeedFormat::JunosDynamicAddress, NOW)
+            .expect("junos"),
+        include_str!("../tests/fixtures/junos_dynamic_address.txt")
+    );
+    assert!(
+        !feed
+            .render(FeedFormat::JunosDynamicAddress, NOW)
+            .expect("junos")
+            .contains("blocked.example")
+    );
+}
+
+#[test]
+fn per_change_cap_does_not_limit_the_live_feed() {
+    let mut feed = FeedVersions::open(policy(
+        &[],
+        &[],
+        &[],
+        Limits {
+            max_entries: 1,
+            ..Limits::default()
+        },
+    ));
+    publish_one(&mut feed, IndicatorKind::Ip, "1.1.1.1").expect("one");
+    publish_one(&mut feed, IndicatorKind::Ip, "1.0.0.1").expect("another change");
+    let err = feed
+        .publish(
+            &proposal(vec![
+                entry(IndicatorKind::Domain, "one.example"),
+                entry(IndicatorKind::Domain, "two.example"),
+            ]),
+            NOW,
+        )
+        .expect_err("cap");
+    assert!(matches!(
+        err,
+        VersionError::Admit(AdmitError::TooMany { count: 2, max: 1 })
+    ));
+    assert_eq!(feed.latest().expect("snap").entries().len(), 2);
+}
