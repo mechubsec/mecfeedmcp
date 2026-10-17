@@ -6,3 +6,4 @@
 - CI, cargo-deny, cargo-audit, gitleaks, CodeQL, packaging conformance.
 - Distroless images and the mecmcp v0.28.1 release pipeline.
 - Empty MCP tool surface and empty read-only feed server. Not usable in production.
+- Indicator checks reject special-purpose ranges and overly broad prefixes.
