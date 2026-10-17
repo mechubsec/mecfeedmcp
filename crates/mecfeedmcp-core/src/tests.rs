@@ -413,23 +413,6 @@ mod props {
         ))
     }
 
-    fn assert_absent_or_rejected(kind: IndicatorKind, value: &str) -> Result<(), TestCaseError> {
-        let mut feed = feed();
-        if publish_one(&mut feed, kind, value).is_ok() {
-            for format in [
-                FeedFormat::PanosEdl,
-                FeedFormat::FortigateThreatFeed,
-                FeedFormat::OpnsenseUrlTable,
-                FeedFormat::JunosDynamicAddress,
-            ] {
-                if let Ok(text) = feed.render(format, NOW) {
-                    prop_assert!(!text.lines().any(|l| l.contains(value)), "{value}");
-                }
-            }
-        }
-        Ok(())
-    }
-
     proptest! {
         #[test]
         fn reserved_own_and_allowlisted_ips_never_reach_a_feed(
@@ -455,12 +438,9 @@ mod props {
             ],
         ) {
             let value = parts.join(".");
+            prop_assume!(value.parse::<std::net::IpAddr>().is_err());
             let mut feed = feed();
-            if kind == IndicatorKind::Domain {
-                prop_assert!(publish_one(&mut feed, kind, &value).is_err(), "{value}");
-            } else {
-                assert_absent_or_rejected(kind, &value)?;
-            }
+            prop_assert!(publish_one(&mut feed, kind, &value).is_err(), "{kind:?} {value}");
         }
 
         #[test]
