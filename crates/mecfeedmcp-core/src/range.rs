@@ -68,11 +68,24 @@ pub struct Indicator {
     pub value: String,
 }
 
+/// Escape and truncate an untrusted value for error text.
+fn shown(value: &str) -> String {
+    let mut out: String = value
+        .chars()
+        .take(64)
+        .flat_map(char::escape_debug)
+        .collect();
+    if value.chars().count() > 64 {
+        out.push_str("...");
+    }
+    out
+}
+
 /// Why an indicator was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidationError {
     /// The value could not be parsed as the declared kind.
-    #[error("unparseable {kind:?} indicator: {value}")]
+    #[error("unparseable {kind:?} indicator: {}", shown(value))]
     Unparseable {
         /// Declared kind.
         kind: IndicatorKind,
@@ -80,7 +93,7 @@ pub enum ValidationError {
         value: String,
     },
     /// Special-purpose address space, or a prefix broader than the minimum length.
-    #[error("indicator is in a reserved range: {0}")]
+    #[error("indicator is in a reserved range: {}", shown(_0))]
     Reserved(String),
     /// Empty or whitespace-only value.
     #[error("indicator value is empty")]

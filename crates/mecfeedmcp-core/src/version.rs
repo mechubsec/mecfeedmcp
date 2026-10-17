@@ -1,10 +1,10 @@
-//! Immutable numbered snapshots. Rollback republishes the previous version.
+//! Immutable numbered snapshots. Rollback republishes a named earlier version.
 //! An expiry sweep publishes a new version with the expired rows removed.
 
 use sha2::{Digest, Sha256};
 
 use crate::model::Proposal;
-use crate::policy::{FeedIndicator, Policy, admit};
+use crate::policy::{FeedIndicator, Policy, admit, screen_all};
 use crate::render::{FeedFormat, RenderError, render_feed};
 
 /// Why a version operation failed.
@@ -13,9 +13,25 @@ pub enum VersionError {
     /// No snapshot has been published.
     #[error("no published version")]
     Empty,
-    /// The latest snapshot has no parent to republish.
-    #[error("no previous version to republish")]
+    /// The target is unknown or is already the latest version.
+    #[error("no such earlier version to republish")]
     NothingToRollBack,
+    /// The latest version is not the one the caller expected. Nothing was published.
+    #[error("latest version is {latest}, expected {expected}")]
+    Stale {
+        /// Version the caller expected to be latest.
+        expected: u64,
+        /// Actual latest version.
+        latest: u64,
+    },
+    /// A restored row no longer passes the current policy. Nothing was published.
+    #[error("restored entry {index}: {reason}")]
+    Restored {
+        /// Zero-based index in the target snapshot.
+        index: usize,
+        /// Why that row failed.
+        reason: crate::policy::EntryError,
+    },
     /// `now` is negative.
     #[error("clock is not acceptable")]
     Clock,
@@ -154,24 +170,42 @@ impl FeedVersions {
         Ok(self.push(next))
     }
 
-    /// Append a new snapshot whose entries are those of the previous version.
+    /// Append a new snapshot with the entries of version `target`.
+    ///
+    /// The caller names the latest version it saw, so a retried call fails
+    /// as stale instead of acting on a newer log. Restored rows are screened
+    /// against the current policy.
     ///
     /// # Errors
     ///
-    /// Returns [`VersionError::Empty`] or [`VersionError::NothingToRollBack`]
-    /// when there is no previous version.
-    pub fn rollback(&mut self) -> Result<&Snapshot, VersionError> {
+    /// Returns [`VersionError::Empty`], [`VersionError::Clock`],
+    /// [`VersionError::Stale`], [`VersionError::NothingToRollBack`] (unknown
+    /// target, or target is the latest) or [`VersionError::Restored`]. The log
+    /// is unchanged on error.
+    pub fn rollback_to(
+        &mut self,
+        target: u64,
+        expected_latest: u64,
+        now: i64,
+    ) -> Result<&Snapshot, VersionError> {
+        if now < 0 {
+            return Err(VersionError::Clock);
+        }
         let entries = {
             let latest = self.snapshots.last().ok_or(VersionError::Empty)?;
-            let parent = latest
-                .manifest
-                .parent
-                .ok_or(VersionError::NothingToRollBack)?;
-            let previous = self
-                .snapshots
-                .iter()
-                .find(|snapshot| snapshot.manifest.number == parent)
-                .ok_or(VersionError::NothingToRollBack)?;
+            let latest_number = latest.manifest.number;
+            if latest_number != expected_latest {
+                return Err(VersionError::Stale {
+                    expected: expected_latest,
+                    latest: latest_number,
+                });
+            }
+            if target == latest_number {
+                return Err(VersionError::NothingToRollBack);
+            }
+            let previous = self.get(target).ok_or(VersionError::NothingToRollBack)?;
+            screen_all(&previous.entries, &self.policy, now)
+                .map_err(|(index, reason)| VersionError::Restored { index, reason })?;
             previous.entries.clone()
         };
         Ok(self.push(entries))

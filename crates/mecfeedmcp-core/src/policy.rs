@@ -292,6 +292,14 @@ pub enum AdmitError {
         /// Why that entry failed.
         reason: EntryError,
     },
+    /// A row carried forward from the live list no longer passes screening.
+    #[error("live entry {index}: {reason}")]
+    Live {
+        /// Zero-based index in the live list after expired rows are dropped.
+        index: usize,
+        /// Why that row failed.
+        reason: EntryError,
+    },
 }
 
 /// Admit `proposal` against `live`. On success, returns the next full entry list.
@@ -324,8 +332,22 @@ pub fn admit(
             admit_one(policy, entry, now).map_err(|reason| AdmitError::Entry { index, reason })?;
         upsert(&mut next, admitted, now).map_err(|reason| AdmitError::Entry { index, reason })?;
     }
+    next.retain(|entry| entry.expires_at > now);
+    screen_all(&next, policy, now).map_err(|(index, reason)| AdmitError::Live { index, reason })?;
     sort_entries(&mut next);
     Ok(next)
+}
+
+/// Screen every row. On failure returns the index of the first failing row.
+pub(crate) fn screen_all(
+    entries: &[FeedIndicator],
+    policy: &Policy,
+    now: i64,
+) -> Result<(), (usize, EntryError)> {
+    entries
+        .iter()
+        .enumerate()
+        .try_for_each(|(index, entry)| screen(entry, policy, now).map_err(|reason| (index, reason)))
 }
 
 /// Re-check one stored entry before it is rendered.
@@ -600,6 +622,14 @@ fn normalize_domain(raw: &str) -> Result<String, EntryError> {
     }
     let labels: Vec<&str> = value.split('.').collect();
     if labels.len() < 2 || labels.iter().any(|label| !valid_label(label)) {
+        return Err(unparseable_domain(&value));
+    }
+    // A TLD is alphabetic (or `xn--`). A numeric last label is an address in
+    // a legacy dotted form, which must not be admitted as a name.
+    let numeric_tld = labels
+        .last()
+        .is_none_or(|tld| !tld.starts_with(|c: char| c.is_ascii_alphabetic()));
+    if numeric_tld {
         return Err(unparseable_domain(&value));
     }
     validate_indicator(&Indicator {

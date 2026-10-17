@@ -285,7 +285,7 @@ fn rollback_republishes_the_previous_snapshot_and_leaves_it_immutable() {
         .content_digest()
         .to_string();
     publish_one(&mut feed, IndicatorKind::Ip, "1.0.0.1").expect("v2");
-    feed.rollback().expect("rollback");
+    feed.rollback_to(1, 2, NOW).expect("rollback");
     assert_eq!(feed.latest().expect("v3").manifest().number(), 3);
     assert_eq!(feed.latest().expect("v3").manifest().parent(), Some(2));
     assert_eq!(
@@ -301,11 +301,168 @@ fn rollback_republishes_the_previous_snapshot_and_leaves_it_immutable() {
         v1_digest
     );
     assert_eq!(feed.get(1).expect("v1").entries().len(), 1);
-    assert!(feed.rollback().is_ok());
+    let retry = feed.rollback_to(1, 2, NOW).expect_err("stale retry");
+    assert_eq!(
+        retry,
+        VersionError::Stale {
+            expected: 2,
+            latest: 3
+        }
+    );
+    assert_eq!(feed.latest().expect("v3").manifest().number(), 3);
     let err = FeedVersions::open(empty_policy())
-        .rollback()
+        .rollback_to(1, 1, NOW)
         .expect_err("empty");
     assert_eq!(err, VersionError::Empty);
+}
+
+#[test]
+fn rollback_refuses_unknown_or_current_targets_and_screens_restored_rows() {
+    let mut feed = FeedVersions::open(empty_policy());
+    publish_one(&mut feed, IndicatorKind::Ip, "1.1.1.1").expect("v1");
+    publish_one(&mut feed, IndicatorKind::Ip, "1.0.0.1").expect("v2");
+    assert_eq!(
+        feed.rollback_to(2, 2, NOW).expect_err("current"),
+        VersionError::NothingToRollBack
+    );
+    assert_eq!(
+        feed.rollback_to(9, 2, NOW).expect_err("unknown"),
+        VersionError::NothingToRollBack
+    );
+    feed.update_policy(policy(&["1.1.1.0/24"], &[], &[], Limits::default()));
+    let err = feed.rollback_to(1, 2, NOW).expect_err("restored row");
+    assert!(matches!(err, VersionError::Restored { .. }));
+    assert_eq!(feed.latest().expect("v2").manifest().number(), 2);
+}
+
+#[test]
+fn address_lookalikes_are_not_admitted_as_domains() {
+    let mut feed = FeedVersions::open(policy(&["8.8.8.0/24"], &[], &[], Limits::default()));
+    for value in [
+        "10.0.0.01",
+        "127.1",
+        "0x0a.0.0.1",
+        "192.168.1",
+        "8.8.8.010",
+        "1.2.3",
+    ] {
+        assert!(
+            publish_one(&mut feed, IndicatorKind::Domain, value).is_err(),
+            "{value}"
+        );
+    }
+    assert!(feed.latest().is_none());
+    publish_one(&mut feed, IndicatorKind::Domain, "bad.example").expect("name");
+    publish_one(&mut feed, IndicatorKind::Domain, "bad.xn--p1ai").expect("punycode tld");
+}
+
+#[test]
+fn publish_drops_expired_rows_and_rescreens_live_rows() {
+    let mut feed = FeedVersions::open(empty_policy());
+    let mut short = entry(IndicatorKind::Ip, "1.0.0.1");
+    short.expires_at = Some(NOW + 10);
+    feed.publish(&proposal(vec![short]), NOW).expect("v1");
+    feed.publish(
+        &proposal(vec![entry(IndicatorKind::Ip, "1.1.1.1")]),
+        NOW + 20,
+    )
+    .expect("v2");
+    let values: Vec<_> = feed
+        .latest()
+        .expect("v2")
+        .entries()
+        .iter()
+        .map(|e| e.value().to_string())
+        .collect();
+    assert_eq!(values, ["1.1.1.1"]);
+
+    feed.update_policy(policy(&["1.1.1.0/24"], &[], &[], Limits::default()));
+    let err = feed
+        .publish(
+            &proposal(vec![entry(IndicatorKind::Ip, "1.0.0.1")]),
+            NOW + 20,
+        )
+        .expect_err("live row now violates policy");
+    assert!(matches!(err, VersionError::Admit(AdmitError::Live { .. })));
+    assert_eq!(feed.latest().expect("v2").manifest().number(), 2);
+}
+
+#[test]
+fn error_text_escapes_and_truncates_untrusted_values() {
+    let long = format!("a\n\u{1b}[31m{}", "x".repeat(200));
+    let err = crate::validate_indicator(&crate::Indicator {
+        kind: IndicatorKind::Domain,
+        value: long,
+    })
+    .expect_err("whitespace");
+    let text = err.to_string();
+    assert!(!text.contains('\n') && !text.contains('\u{1b}'));
+    assert!(text.len() < 200, "{}", text.len());
+}
+
+mod props {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn feed() -> FeedVersions {
+        FeedVersions::open(policy(
+            &["8.8.8.0/24", "2606:4700:4700::/48"],
+            &["9.9.9.0/24"],
+            &["partner.test"],
+            Limits::default(),
+        ))
+    }
+
+    fn assert_absent_or_rejected(kind: IndicatorKind, value: &str) -> Result<(), TestCaseError> {
+        let mut feed = feed();
+        if publish_one(&mut feed, kind, value).is_ok() {
+            for format in [
+                FeedFormat::PanosEdl,
+                FeedFormat::FortigateThreatFeed,
+                FeedFormat::OpnsenseUrlTable,
+                FeedFormat::JunosDynamicAddress,
+            ] {
+                if let Ok(text) = feed.render(format, NOW) {
+                    prop_assert!(!text.lines().any(|l| l.contains(value)), "{value}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #[test]
+        fn reserved_own_and_allowlisted_ips_never_reach_a_feed(
+            a in any::<u8>(), b in any::<u8>(), c in any::<u8>(), d in any::<u8>(), pick in 0usize..6,
+        ) {
+            let ip = match pick {
+                0 => format!("10.{b}.{c}.{d}"),
+                1 => format!("192.168.{c}.{d}"),
+                2 => format!("127.{b}.{c}.{d}"),
+                3 => format!("8.8.8.{d}"),
+                4 => format!("9.9.9.{d}"),
+                _ => format!("{}.{b}.{c}.{d}", 224 + (a % 32)),
+            };
+            let mut feed = feed();
+            prop_assert!(publish_one(&mut feed, IndicatorKind::Ip, &ip).is_err(), "{ip}");
+        }
+
+        #[test]
+        fn lookalike_strings_never_reach_a_feed(
+            parts in proptest::collection::vec("(0x[0-9a-f]{1,2}|0[0-7]{1,3}|[0-9]{1,3})", 1..5),
+            kind in prop_oneof![
+                Just(IndicatorKind::Ip), Just(IndicatorKind::Cidr), Just(IndicatorKind::Domain)
+            ],
+        ) {
+            let value = parts.join(".");
+            let mut feed = feed();
+            if kind == IndicatorKind::Domain {
+                prop_assert!(publish_one(&mut feed, kind, &value).is_err(), "{value}");
+            } else {
+                assert_absent_or_rejected(kind, &value)?;
+            }
+        }
+    }
 }
 
 #[test]

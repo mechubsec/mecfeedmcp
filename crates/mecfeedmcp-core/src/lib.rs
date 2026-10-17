@@ -19,7 +19,7 @@ pub use range::{
     validate_indicator,
 };
 pub use render::{FeedFormat, RenderError, render_feed};
-pub use version::{FeedVersions, Snapshot, SweepOutcome, VersionError};
+pub use version::{FeedVersions, Manifest, Snapshot, SweepOutcome, VersionError};
 
 /// Crate version from the workspace package.
 #[must_use]
