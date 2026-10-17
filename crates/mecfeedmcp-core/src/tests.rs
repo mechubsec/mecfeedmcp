@@ -462,6 +462,70 @@ mod props {
                 assert_absent_or_rejected(kind, &value)?;
             }
         }
+
+        #[test]
+        fn prefixes_inside_blocked_ranges_never_reach_a_feed(
+            host in any::<u8>(),
+            len in 8u8..=32,
+            pick in 0usize..10,
+        ) {
+            let value = blocked_v4_prefix(pick, host, len);
+            let mut feed = feed();
+            prop_assert!(
+                publish_one(&mut feed, IndicatorKind::Cidr, &value).is_err(),
+                "{value}"
+            );
+        }
+
+        #[test]
+        fn ipv6_prefixes_inside_blocked_ranges_never_reach_a_feed(
+            host in any::<u16>(),
+            pick in 0usize..4,
+        ) {
+            let value = blocked_v6_prefix(pick, host);
+            let mut feed = feed();
+            prop_assert!(
+                publish_one(&mut feed, IndicatorKind::Cidr, &value).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    fn blocked_v4_prefix(pick: usize, host: u8, len: u8) -> String {
+        let (base, floor): (std::net::Ipv4Addr, u8) = match pick % 10 {
+            0 => (std::net::Ipv4Addr::new(10, host, 1, 1), 8),
+            1 => (std::net::Ipv4Addr::new(192, 168, host, 1), 16),
+            2 => (std::net::Ipv4Addr::new(172, 16 + (host % 16), 1, 1), 12),
+            3 => (std::net::Ipv4Addr::new(127, host, 0, 1), 8),
+            4 => (std::net::Ipv4Addr::new(100, 64 + (host % 64), 0, 1), 10),
+            5 => (std::net::Ipv4Addr::new(169, 254, host, 1), 16),
+            6 => (std::net::Ipv4Addr::new(8, 8, 8, host), 24),
+            7 => (std::net::Ipv4Addr::new(9, 9, 9, host), 24),
+            8 => (std::net::Ipv4Addr::new(203, 0, 113, host), 24),
+            _ => (std::net::Ipv4Addr::new(198, 51, 100, host), 24),
+        };
+        let len = u32::from(len.max(floor));
+        let host_bits = 32 - len;
+        let host_mask = if host_bits == 0 {
+            0
+        } else {
+            (1u32 << host_bits) - 1
+        };
+        let network = u32::from(base) & !host_mask;
+        format!("{}/{}", std::net::Ipv4Addr::from(network), len)
+    }
+
+    fn blocked_v6_prefix(pick: usize, host: u16) -> String {
+        let low = u32::from(host) % 256;
+        match pick % 4 {
+            0 => format!("fd{low:02x}::/32"),
+            1 => {
+                let hi = 0x80 + (u32::from(host) % 0x40);
+                format!("fe{hi:02x}::/32")
+            }
+            2 => format!("ff{low:02x}::/32"),
+            _ => format!("2606:4700:4700:{host:x}::/64"),
+        }
     }
 }
 
