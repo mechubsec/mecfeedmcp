@@ -1,0 +1,2 @@
+u mecfeedmcp - "mecfeedmcp service" /var/lib/mecfeedmcp /usr/sbin/nologin
+u mecfeed-serve - "mecfeed-serve service" /var/lib/mecfeed-serve /usr/sbin/nologin

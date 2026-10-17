@@ -1,0 +1,109 @@
+name: Release container image
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  release:
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: mechubsec/mecmcp/.github/workflows/reusable-release-image.yml@db9e2ea9d1a1ed7e7a962a236e579ad62bb24435 # v0.28.1
+    with:
+      image: ghcr.io/${{ github.repository }}
+      dockerhub-image: docker.io/mechub/mecfeedmcp
+      description: 'Governed threat-intel feed MCP server'
+      platforms: linux/amd64
+    secrets:
+      dockerhub-username: ${{ secrets.DOCKERHUB_USERNAME }}
+      dockerhub-token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  # reusable-release-image.yml@v0.28.1 has a `context` input and no `file`
+  # input, so the serve image copies Dockerfile.serve over Dockerfile in
+  # smoke-test-command (runs after checkout, before buildx push).
+  release-serve:
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: mechubsec/mecmcp/.github/workflows/reusable-release-image.yml@db9e2ea9d1a1ed7e7a962a236e579ad62bb24435 # v0.28.1
+    with:
+      image: ghcr.io/${{ github.repository_owner }}/mecfeed-serve
+      dockerhub-image: docker.io/mechub/mecfeed-serve
+      description: 'Read-only TLS feed server firewalls pull from'
+      platforms: linux/amd64
+      smoke-test-command: cp Dockerfile.serve Dockerfile
+    secrets:
+      dockerhub-username: ${{ secrets.DOCKERHUB_USERNAME }}
+      dockerhub-token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  scan:
+    name: Scan pushed MCP image
+    needs: release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Trivy 0.70.0
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.70.0
+      - name: Scan pushed image
+        run: |
+          trivy image --scanners vuln --exit-code 1 --ignore-unfixed \
+            "ghcr.io/${{ github.repository }}@${{ needs.release.outputs.digest }}"
+
+  scan-serve:
+    name: Scan pushed feed-server image
+    needs: release-serve
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Trivy 0.70.0
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.70.0
+      - name: Scan pushed image
+        run: |
+          trivy image --scanners vuln --exit-code 1 --ignore-unfixed \
+            "ghcr.io/${{ github.repository_owner }}/mecfeed-serve@${{ needs.release-serve.outputs.digest }}"
+
+  tag-version:
+    name: Resolve tag version
+    runs-on: ubuntu-24.04
+    permissions: {}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Strip leading v from the pushed tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+  registry-publish:
+    name: Publish to MCP Registry
+    needs: [release, tag-version]
+    permissions:
+      contents: read
+      id-token: write
+    uses: mechubsec/mecmcp/.github/workflows/reusable-registry-publish.yml@db9e2ea9d1a1ed7e7a962a236e579ad62bb24435 # v0.28.1
+    with:
+      version: ${{ needs.tag-version.outputs.version }}
+      oci-image: ghcr.io/${{ github.repository }}:${{ needs.tag-version.outputs.version }}

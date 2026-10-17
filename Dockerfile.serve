@@ -1,0 +1,44 @@
+# mecfeed-serve read-only feed server container image
+#
+# Multi-stage build producing a distroless image with no shell. Builder glibc
+# generation must be ≤ runtime generation: Debian 13 (trixie) on both sides.
+
+# Pinned to the amd64 digest resolved on 2026-08-25.
+FROM rust:1.99-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581 AS builder
+
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/mecfeedmcp/Cargo.toml crates/mecfeedmcp/
+COPY crates/mecfeedmcp-core/Cargo.toml crates/mecfeedmcp-core/
+COPY crates/mecfeed-serve/Cargo.toml crates/mecfeed-serve/
+
+RUN mkdir -p crates/mecfeedmcp/src crates/mecfeedmcp-core/src crates/mecfeed-serve/src && \
+    echo 'fn main() {}' > crates/mecfeedmcp/src/main.rs && \
+    echo '' > crates/mecfeedmcp/src/lib.rs && \
+    echo 'fn main() {}' > crates/mecfeed-serve/src/main.rs && \
+    echo '' > crates/mecfeedmcp-core/src/lib.rs && \
+    cargo build --release -p mecfeed-serve && \
+    rm -rf crates/mecfeedmcp/src crates/mecfeedmcp-core/src crates/mecfeed-serve/src
+
+COPY crates/ crates/
+RUN touch crates/mecfeedmcp/src/main.rs crates/mecfeedmcp-core/src/lib.rs crates/mecfeed-serve/src/main.rs && \
+    cargo build --release --locked -p mecfeed-serve
+
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
+
+USER 65532:65532
+
+COPY --from=builder /build/target/release/mecfeed-serve /usr/local/bin/mecfeed-serve
+
+LABEL org.opencontainers.image.title="mecfeed-serve"
+LABEL org.opencontainers.image.description="Read-only TLS feed server firewalls pull from"
+LABEL org.opencontainers.image.source="https://github.com/mechubsec/mecfeedmcp"
+LABEL org.opencontainers.image.licenses="MIT"
+
+# TLS paths live in ENTRYPOINT so an operator --listen override cannot drop them.
+ENTRYPOINT ["/usr/local/bin/mecfeed-serve", \
+    "--tls-cert", "/etc/mecfeed-serve/tls.crt", \
+    "--tls-key", "/etc/mecfeed-serve/tls.key", \
+    "--snapshot-dir", "/var/lib/mecfeed-serve/snapshots"]
+CMD ["--listen", "0.0.0.0:8443"]

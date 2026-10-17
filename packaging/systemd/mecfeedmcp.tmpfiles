@@ -1,0 +1,4 @@
+d /etc/mecfeedmcp 0750 root mecfeedmcp -
+d /var/lib/mecfeedmcp 0700 mecfeedmcp mecfeedmcp -
+d /etc/mecfeed-serve 0750 root mecfeed-serve -
+d /var/lib/mecfeed-serve 0700 mecfeed-serve mecfeed-serve -

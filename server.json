@@ -1,0 +1,80 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.mechubsec/mecfeedmcp",
+  "title": "mecfeedmcp",
+  "description": "Governed threat-intel feed MCP server. Under construction. Rust.",
+  "version": "0.1.0",
+  "websiteUrl": "https://github.com/mechubsec/mecfeedmcp",
+  "repository": {
+    "url": "https://github.com/mechubsec/mecfeedmcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/mechubsec/mecfeedmcp:0.1.0",
+      "runtimeHint": "docker",
+      "runtimeArguments": [
+        {
+          "type": "positional",
+          "value": "--rm",
+          "isRequired": true
+        },
+        {
+          "type": "positional",
+          "value": "-i",
+          "isRequired": true
+        },
+        {
+          "type": "named",
+          "name": "--user",
+          "value": "65532:65532",
+          "isRequired": true
+        },
+        {
+          "type": "named",
+          "name": "-v",
+          "value": "{config_file}:/etc/mecfeedmcp/feed.json:ro",
+          "isRequired": true,
+          "variables": {
+            "config_file": {
+              "description": "Absolute host path to feed.json. Credential material stays in the environment, not in this manifest.",
+              "format": "filepath",
+              "isRequired": true
+            }
+          }
+        },
+        {
+          "type": "named",
+          "name": "-v",
+          "value": "{state_dir}:/var/lib/mecfeedmcp",
+          "isRequired": true,
+          "variables": {
+            "state_dir": {
+              "description": "Absolute host directory for tokens and the audit HMAC key. Must be writable by UID 65532.",
+              "format": "filepath",
+              "isRequired": true
+            }
+          }
+        }
+      ],
+      "packageArguments": [
+        {
+          "type": "named",
+          "name": "--transport",
+          "value": "stdio",
+          "isRequired": true
+        },
+        {
+          "type": "named",
+          "name": "--state-file",
+          "value": "/var/lib/mecfeedmcp/changeset-state.json",
+          "isRequired": true
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
