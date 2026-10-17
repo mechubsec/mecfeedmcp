@@ -265,6 +265,9 @@ pub enum EntryError {
     /// The source is empty, too long, or not a single token.
     #[error("source is not a single token")]
     Source,
+    /// The last two labels are a known multi-label public suffix.
+    #[error("domain needs another label under a public suffix")]
+    BroadDomain,
 }
 
 /// Why a change was rejected. Nothing from that change is published.
@@ -383,6 +386,7 @@ pub(crate) fn screen(entry: &FeedIndicator, policy: &Policy, now: i64) -> Result
             if canonical != entry.value {
                 return Err(EntryError::Uncanonical);
             }
+            reject_broad_domain(&canonical)?;
             if domain_matches(&entry.value, &policy.allow_suffixes) {
                 return Err(EntryError::Allowlisted);
             }
@@ -430,6 +434,7 @@ fn admit_one(
         }
         IndicatorKind::Domain => {
             let canonical = normalize_domain(entry.value.trim())?;
+            reject_broad_domain(&canonical)?;
             if domain_matches(&canonical, &policy.allow_suffixes) {
                 return Err(EntryError::Allowlisted);
             }
@@ -637,6 +642,31 @@ fn normalize_domain(raw: &str) -> Result<String, EntryError> {
         value: value.clone(),
     })?;
     Ok(value)
+}
+
+/// Names shorter than a two-label public suffix plus two labels are too broad.
+fn reject_broad_domain(canonical: &str) -> Result<(), EntryError> {
+    let labels: Vec<&str> = canonical.split('.').collect();
+    if labels.len() < 4 && last_two_are_public_suffix(&labels) {
+        return Err(EntryError::BroadDomain);
+    }
+    Ok(())
+}
+
+fn last_two_are_public_suffix(labels: &[&str]) -> bool {
+    let Some((tld, rest)) = labels.split_last() else {
+        return false;
+    };
+    let Some(sld) = rest.last() else {
+        return false;
+    };
+    let mut last_two = String::with_capacity(sld.len() + 1 + tld.len());
+    last_two.push_str(sld);
+    last_two.push('.');
+    last_two.push_str(tld);
+    crate::two_label_public_suffixes::TWO_LABEL_PUBLIC_SUFFIXES
+        .binary_search(&last_two.as_str())
+        .is_ok()
 }
 
 fn valid_label(label: &str) -> bool {
