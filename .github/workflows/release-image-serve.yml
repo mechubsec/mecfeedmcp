@@ -1,0 +1,61 @@
+name: Release feed server image
+
+# Separate workflow from release-image.yml on purpose. Both call
+# reusable-release-image.yml, whose SBOM job always uploads an artifact
+# named sbom-cyclonedx. Two calls in one workflow run collide on that
+# name (upload-artifact v7 refuses a second upload). A second workflow
+# file is a second run, so the names do not meet.
+#
+# reusable-release-image.yml@v0.28.1 has a context input and no file
+# input. smoke-test-command runs after that workflow's checkout and
+# before the build, so copying Dockerfile.serve over Dockerfile selects
+# the feed server image.
+#
+# GHCR packages pushed with GITHUB_TOKEN must live under this repository:
+# ghcr.io/mechubsec/mecfeedmcp/mecfeed-serve. Docker Hub is a separate
+# repository, docker.io/mechub/mecfeed-serve.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  release-serve:
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: mechubsec/mecmcp/.github/workflows/reusable-release-image.yml@db9e2ea9d1a1ed7e7a962a236e579ad62bb24435 # v0.28.1
+    with:
+      image: ghcr.io/${{ github.repository }}/mecfeed-serve
+      dockerhub-image: docker.io/mechub/mecfeed-serve
+      description: 'Read-only TLS feed server firewalls pull from'
+      platforms: linux/amd64
+      smoke-test-command: cp Dockerfile.serve Dockerfile
+    secrets:
+      dockerhub-username: ${{ secrets.DOCKERHUB_USERNAME }}
+      dockerhub-token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  scan-serve:
+    name: Scan pushed feed-server image
+    needs: release-serve
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Trivy 0.70.0
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.70.0
+      - name: Scan pushed image
+        run: |
+          trivy image --scanners vuln --exit-code 1 --ignore-unfixed \
+            "ghcr.io/${{ github.repository }}/mecfeed-serve@${{ needs.release-serve.outputs.digest }}"

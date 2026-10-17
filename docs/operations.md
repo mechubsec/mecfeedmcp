@@ -24,7 +24,7 @@ once TLS files exist).
 
 ## Docker
 
-Images: `ghcr.io/mechubsec/mecfeedmcp` and `ghcr.io/mechubsec/mecfeed-serve`
+Images: `ghcr.io/mechubsec/mecfeedmcp` and `ghcr.io/mechubsec/mecfeedmcp/mecfeed-serve`
 (and the matching `docker.io/mechub/...` names). Both run as uid **65532**.
 The MCP image's `ENTRYPOINT` keeps `--device-mapping`, `--tokens-file`, and
 `--audit-hmac-key-file` so an operator `--host` override cannot drop them.
