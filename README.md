@@ -37,7 +37,7 @@
 
 ### Feed formats (rendered from one source of truth)
 
-PAN-OS External Dynamic Lists · Junos SRX dynamic-address / SecIntel feeds · FortiGate external threat feeds · OPNsense URL-table aliases. Each firewall subscribes once (a one-time config change made through its own mechub MCP server); after that only the feed content changes.
+PAN-OS External Dynamic Lists · Junos SRX dynamic-address / SecIntel feeds · FortiGate external threat feeds · OPNsense URL-table aliases. Each format is one document per indicator kind (address, prefix, domain). Junos has no domain document. Each firewall subscribes once (a one-time config change made through its own mechub MCP server); after that only the feed content changes.
 
 ## Security design for `mecfeed-serve`
 
