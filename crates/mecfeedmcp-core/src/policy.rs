@@ -265,6 +265,9 @@ pub enum EntryError {
     /// The source is empty, too long, or not a single token.
     #[error("source is not a single token")]
     Source,
+    /// The last two labels are a known multi-label public suffix.
+    #[error("domain needs another label under a public suffix")]
+    BroadDomain,
 }
 
 /// Why a change was rejected. Nothing from that change is published.
@@ -632,11 +635,33 @@ fn normalize_domain(raw: &str) -> Result<String, EntryError> {
     if numeric_tld {
         return Err(unparseable_domain(&value));
     }
+    // Last two labels of every `*.co.uk` name are `co.uk`. Bound the check
+    // to names shorter than suffix + two labels so a host under the
+    // registrable domain can still be admitted.
+    if labels.len() < 4 && last_two_are_public_suffix(&labels) {
+        return Err(EntryError::BroadDomain);
+    }
     validate_indicator(&Indicator {
         kind: IndicatorKind::Domain,
         value: value.clone(),
     })?;
     Ok(value)
+}
+
+fn last_two_are_public_suffix(labels: &[&str]) -> bool {
+    let Some((tld, rest)) = labels.split_last() else {
+        return false;
+    };
+    let Some(sld) = rest.last() else {
+        return false;
+    };
+    let mut last_two = String::with_capacity(sld.len() + 1 + tld.len());
+    last_two.push_str(sld);
+    last_two.push('.');
+    last_two.push_str(tld);
+    crate::two_label_public_suffixes::TWO_LABEL_PUBLIC_SUFFIXES
+        .binary_search(&last_two.as_str())
+        .is_ok()
 }
 
 fn valid_label(label: &str) -> bool {

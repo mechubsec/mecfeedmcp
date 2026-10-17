@@ -10,3 +10,5 @@
 - `mecfeedmcp-core` admits indicators, versions immutable snapshots, and renders vendor feed documents.
 - A domain's final label must start with a letter. Publishing re-checks the live set, and republishing an earlier snapshot names that snapshot and the current latest.
 - Validation errors bound the value they echo.
+- Each feed document is one format and one indicator kind. Junos has no domain document.
+- A name whose last two labels are a known multi-label public suffix needs one more label.
