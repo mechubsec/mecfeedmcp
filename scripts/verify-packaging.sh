@@ -143,6 +143,8 @@ assert_exact_mecmcp_sbom_set() {
             {name: "mecmcp-audit", version: "0.28.1"},
             {name: "mecmcp-auth", version: "0.28.1"},
             {name: "mecmcp-changeset", version: "0.28.1"},
+            {name: "mecmcp-http", version: "0.28.1"},
+            {name: "mecmcp-openapi", version: "0.28.1"},
             {name: "mecmcp-redact", version: "0.28.1"},
             {name: "mecmcp-runtime", version: "0.28.1"},
             {name: "mecmcp-secret", version: "0.28.1"},
@@ -397,6 +399,8 @@ required_mecmcp_pairs=(
     '["mecmcp-audit", "0.28.1"],'
     '["mecmcp-auth", "0.28.1"],'
     '["mecmcp-changeset", "0.28.1"],'
+    '["mecmcp-http", "0.28.1"],'
+    '["mecmcp-openapi", "0.28.1"],'
     '["mecmcp-redact", "0.28.1"],'
     '["mecmcp-runtime", "0.28.1"],'
     '["mecmcp-secret", "0.28.1"],'

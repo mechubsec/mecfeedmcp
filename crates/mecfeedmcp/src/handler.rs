@@ -24,6 +24,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::gate::{self, FeedPublisher, FeedView};
+use crate::misp::{MappedIndicator, MispError, MispPage, MispQuery, MispSource};
 
 /// Unwrap an authorization result, or audit a denial and return it.
 macro_rules! admit {
@@ -69,6 +70,8 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "get_feed",
     "get_feed_history",
     "get_feed_change",
+    "list_indicators",
+    "search_indicators",
     "plan_feed_change",
     "approve_feed_change",
     "apply_feed_change",
@@ -87,15 +90,23 @@ pub const WRITE_TOOLS: &[&str] = &[
 #[derive(Clone)]
 pub struct FeedHandler {
     publisher: Arc<FeedPublisher>,
+    misp: Option<Arc<dyn MispSource>>,
     tool_router: ToolRouter<Self>,
 }
 
 impl FeedHandler {
-    /// Register the feed tools on `publisher`.
+    /// Register the feed tools on `publisher` with no MISP source.
     #[must_use]
     pub fn new(publisher: Arc<FeedPublisher>) -> Self {
+        Self::with_misp(publisher, None)
+    }
+
+    /// Register the feed tools, with an optional read-only MISP source.
+    #[must_use]
+    pub fn with_misp(publisher: Arc<FeedPublisher>, misp: Option<Arc<dyn MispSource>>) -> Self {
         Self {
             publisher,
+            misp,
             tool_router: Self::tool_router(),
         }
     }
@@ -169,6 +180,13 @@ impl FeedHandler {
             None => Err(error_result(
                 "a feed write needs an authenticated principal",
             )),
+        }
+    }
+
+    async fn misp_search(&self, query: &MispQuery) -> Result<MispPage, MispError> {
+        match &self.misp {
+            Some(source) => source.search(query).await,
+            None => Err(MispError::Unconfigured),
         }
     }
 }
@@ -247,6 +265,32 @@ pub struct RollbackFeedInput {
     pub expected_latest: u64,
 }
 
+/// Arguments for [`FeedHandler::list_indicators`].
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListIndicatorsInput {
+    /// `ip`, `cidr`, or `domain`. Applied after the fetch. Absent returns all three.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Maximum mapped rows. Absent uses the policy entry cap.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// Arguments for [`FeedHandler::search_indicators`].
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SearchIndicatorsInput {
+    /// Value match sent to MISP restSearch.
+    pub query: String,
+    /// `ip`, `cidr`, or `domain`. Applied after the fetch. Absent returns all three.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Maximum mapped rows. Absent uses the policy entry cap.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
 #[tool_router]
 impl FeedHandler {
     /// Read one published snapshot.
@@ -299,6 +343,72 @@ impl FeedHandler {
         success(&json!({
             "snapshots": views.iter().map(view_json).collect::<Vec<_>>(),
         }))
+    }
+
+    /// List mapped MISP indicators. Does not plan or publish.
+    #[tool(
+        name = "list_indicators",
+        description = "List mapped MISP indicators of ip, cidr, and domain kinds. Kind is applied after the fetch. truncated is true when the upstream page is full. Read-only. Does not plan or publish a snapshot"
+    )]
+    async fn list_indicators(
+        &self,
+        Parameters(input): Parameters<ListIndicatorsInput>,
+        extensions: Extensions,
+        _cancellation: CancellationToken,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let attribution = Self::attribution(Self::caller(&extensions).as_ref(), None);
+        let mut audit = self.scope(&attribution, "list_indicators", "read");
+        admit!(audit, self.authorize(&extensions, "list_indicators", false));
+        let query = valid!(
+            audit,
+            misp_query(None, input.kind.as_deref(), input.limit, &self.publisher)
+        );
+        let page = match self.misp_search(&query).await {
+            Ok(page) => page,
+            Err(failed) => {
+                audit.fail(&failed);
+                return error(&failed.to_string());
+            }
+        };
+        audit.succeed();
+        success(&page_json(&page))
+    }
+
+    /// Search mapped MISP indicators by value. Does not plan or publish.
+    #[tool(
+        name = "search_indicators",
+        description = "Search mapped MISP indicators by value. Kind is applied after the fetch. truncated is true when the upstream page is full. Read-only. Does not plan or publish a snapshot"
+    )]
+    async fn search_indicators(
+        &self,
+        Parameters(input): Parameters<SearchIndicatorsInput>,
+        extensions: Extensions,
+        _cancellation: CancellationToken,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let attribution = Self::attribution(Self::caller(&extensions).as_ref(), None);
+        let mut audit = self.scope(&attribution, "search_indicators", "read");
+        admit!(
+            audit,
+            self.authorize(&extensions, "search_indicators", false)
+        );
+        let query = valid!(
+            audit,
+            misp_query(
+                Some(input.query),
+                input.kind.as_deref(),
+                input.limit,
+                &self.publisher
+            )
+        );
+        let page = match self.misp_search(&query).await {
+            Ok(page) => page,
+            Err(failed) => {
+                audit.fail(&failed);
+                return error(&failed.to_string());
+            }
+        };
+        audit.succeed();
+        success(&page_json(&page))
     }
 
     /// Read a stored change set, for the approver.
@@ -504,6 +614,7 @@ impl ServerHandler for FeedHandler {
             .with_server_info(Implementation::new("mecfeedmcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "mecfeedmcp publishes versioned threat-intel feed snapshots. \
+                 list_indicators and search_indicators read mapped MISP indicators; kind is applied after the fetch; they do not plan or publish. \
                  plan_feed_change admits a proposal and stores a digest. \
                  get_feed_change shows the approver the planned rows and the diff against the current snapshot; \
                  the approver reads it before approve_feed_change. \
@@ -576,6 +687,62 @@ fn unix_now() -> Result<i64, CallToolResult> {
 
 fn gate_text(error: crate::gate::GateError) -> CallToolResult {
     error_result(error.to_string())
+}
+
+#[allow(clippy::result_large_err)]
+fn misp_query(
+    value: Option<String>,
+    kind: Option<&str>,
+    limit: Option<u32>,
+    publisher: &FeedPublisher,
+) -> Result<MispQuery, CallToolResult> {
+    if let Some(value) = &value
+        && (value.is_empty() || value.len() > 256 || value.chars().any(|c| c.is_control()))
+    {
+        return Err(error_result("MISP request is not acceptable"));
+    }
+    let max = publisher
+        .max_entries()
+        .map_err(|_| error_result("feed state is unavailable"))?;
+    let limit = match limit {
+        None => max,
+        Some(0) => return Err(error_result("MISP request is not acceptable")),
+        Some(requested) => {
+            let requested = usize::try_from(requested)
+                .map_err(|_| error_result("MISP request is not acceptable"))?;
+            if requested > max {
+                return Err(error_result("MISP request is not acceptable"));
+            }
+            requested
+        }
+    };
+    let kind = match kind {
+        None => None,
+        Some(name) => Some(
+            gate::parse_kind(name)
+                .ok_or_else(|| error_result("indicator kind is not acceptable"))?,
+        ),
+    };
+    Ok(MispQuery { value, kind, limit })
+}
+
+fn page_json(page: &MispPage) -> serde_json::Value {
+    json!({
+        "indicators": page.indicators.iter().map(mapped_json).collect::<Vec<_>>(),
+        "skipped": page.skipped,
+        "truncated": page.truncated,
+    })
+}
+
+fn mapped_json(entry: &MappedIndicator) -> serde_json::Value {
+    json!({
+        "kind": kind_name(entry.kind),
+        "value": entry.value,
+        "source": entry.source,
+        "confidence": entry.confidence,
+        "first_seen": entry.first_seen,
+        "last_seen": entry.last_seen,
+    })
 }
 
 fn success(value: &impl Serialize) -> Result<CallToolResult, rmcp::ErrorData> {
@@ -832,5 +999,115 @@ mod tests {
     fn get_feed_change_is_read_only() {
         assert!(KNOWN_TOOLS.contains(&"get_feed_change"));
         assert!(!WRITE_TOOLS.contains(&"get_feed_change"));
+    }
+
+    struct StaticMisp(MispPage);
+
+    #[async_trait::async_trait]
+    impl MispSource for StaticMisp {
+        async fn search(&self, _query: &MispQuery) -> Result<MispPage, crate::misp::MispError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn mapped_ip() -> MappedIndicator {
+        MappedIndicator {
+            kind: IndicatorKind::Ip,
+            value: "1.0.0.1".to_string(),
+            source: "misp".to_string(),
+            confidence: 50,
+            first_seen: 1_700_000_000,
+            last_seen: 1_700_000_000,
+        }
+    }
+
+    fn handler_with_misp(f: &Fixture) -> FeedHandler {
+        FeedHandler::with_misp(
+            Arc::clone(&f.publisher),
+            Some(Arc::new(StaticMisp(MispPage {
+                indicators: vec![mapped_ip()],
+                skipped: 1,
+                truncated: false,
+            }))),
+        )
+    }
+
+    #[tokio::test]
+    async fn list_without_misp_fails_closed() {
+        let f = fixture();
+        let result = f
+            .handler
+            .list_indicators(
+                Parameters(ListIndicatorsInput::default()),
+                extensions(Some(ctx("alice", ActorType::Human))),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("call");
+        assert!(is_error(&result));
+        assert!(format!("{:?}", result.content).contains("MISP is not configured"));
+    }
+
+    #[tokio::test]
+    async fn list_returns_mapped_rows() {
+        let f = fixture();
+        let handler = handler_with_misp(&f);
+        let result = handler
+            .list_indicators(
+                Parameters(ListIndicatorsInput::default()),
+                extensions(Some(ctx("alice", ActorType::Human))),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("call");
+        assert!(!is_error(&result));
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("1.0.0.1"));
+        assert!(text.contains("skipped"));
+        assert!(f.publisher.history().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_without_a_value_fails_closed() {
+        let f = fixture();
+        let handler = handler_with_misp(&f);
+        let result = handler
+            .search_indicators(
+                Parameters(SearchIndicatorsInput {
+                    query: String::new(),
+                    kind: None,
+                    limit: None,
+                }),
+                extensions(Some(ctx("alice", ActorType::Human))),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("call");
+        assert!(is_error(&result));
+    }
+
+    #[tokio::test]
+    async fn indicator_reads_are_outside_write_tools() {
+        assert!(KNOWN_TOOLS.contains(&"list_indicators"));
+        assert!(KNOWN_TOOLS.contains(&"search_indicators"));
+        assert!(!WRITE_TOOLS.contains(&"list_indicators"));
+        assert!(!WRITE_TOOLS.contains(&"search_indicators"));
+    }
+
+    #[tokio::test]
+    async fn wildcard_tool_scope_can_list() {
+        let f = fixture();
+        let handler = handler_with_misp(&f);
+        let mut caller = ctx("alice", ActorType::Human);
+        caller.tools = ScopeSet::Wildcard;
+        let result = handler
+            .list_indicators(
+                Parameters(ListIndicatorsInput::default()),
+                extensions(Some(caller)),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("call");
+        assert!(!is_error(&result));
     }
 }

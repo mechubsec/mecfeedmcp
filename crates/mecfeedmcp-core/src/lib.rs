@@ -14,7 +14,9 @@ mod two_label_public_suffixes;
 mod version;
 
 pub use model::{Proposal, ProposedEntry};
-pub use policy::{AdmitError, EntryError, FeedIndicator, Limits, Policy, PolicyError};
+pub use policy::{
+    AdmitError, EntryError, FeedIndicator, Limits, Policy, PolicyError, normalize_domain,
+};
 pub use range::{
     Indicator, IndicatorKind, MIN_IPV4_PREFIX_LEN, MIN_IPV6_PREFIX_LEN, ValidationError,
     validate_indicator,

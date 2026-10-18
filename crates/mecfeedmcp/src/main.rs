@@ -2,16 +2,14 @@
 
 use anyhow::{Context, Result};
 use mecfeedmcp::{
-    FeedHandler, FeedPublisher, KNOWN_TOOLS, SighupHandler, install_early_sighup_handler,
-    serve_http,
+    FeedConfig, FeedHandler, FeedPublisher, KNOWN_TOOLS, MispClient, SighupHandler,
+    install_early_sighup_handler, serve_http,
 };
-use mecfeedmcp_core::{Limits, Policy};
 use mecmcp_auth::{NoGrant, TokenStoreFile};
 use mecmcp_runtime::cli::{Cli, Command, ParsedCli, Transport};
 use mecmcp_secret::naming::ServerNaming;
 use mecmcp_secret::validate::{CredentialFileRole, CredentialFileSpec, validate_credential_files};
 use rmcp::ServiceExt as _;
-use serde::Deserialize;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -69,22 +67,6 @@ struct ServerCli {
 }
 
 const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 900;
-
-fn default_snapshot_dir() -> PathBuf {
-    PathBuf::from("/var/lib/mecfeedmcp/snapshots")
-}
-
-#[derive(Debug, Deserialize)]
-struct FeedConfig {
-    version: u32,
-    tenant: String,
-    #[serde(default)]
-    changeset_state_file: Option<PathBuf>,
-    #[serde(default = "default_snapshot_dir")]
-    snapshot_dir: PathBuf,
-    #[serde(default)]
-    approval_ttl_secs: Option<u64>,
-}
 
 fn server_naming() -> ServerNaming {
     ServerNaming::derive("mecfeedmcp")
@@ -225,29 +207,22 @@ fn validate_config_file(package_dir: &Path) -> Result<()> {
     let config_path = package_dir.join("config/feed.json.example");
     let content = fs::read_to_string(&config_path)
         .with_context(|| format!("reading {}", config_path.display()))?;
-    let value: serde_json::Value =
-        serde_json::from_str(&content).context("config example is not valid JSON")?;
-    if value.get("version") != Some(&serde_json::json!(1)) {
-        anyhow::bail!("config example version must be 1");
-    }
-    if !value
-        .get("tenant")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty())
-    {
+    let config = FeedConfig::parse(&content).context("config example is not acceptable")?;
+    if config.tenant.is_empty() {
         anyhow::bail!("config example tenant must be a non-empty string");
     }
-    if value.get("changeset_state_file")
-        != Some(&serde_json::json!(
-            "/var/lib/mecfeedmcp/changeset-state.json"
-        ))
+    if config.changeset_state_file.as_deref()
+        != Some(Path::new("/var/lib/mecfeedmcp/changeset-state.json"))
     {
         anyhow::bail!(
             "config example changeset_state_file must be '/var/lib/mecfeedmcp/changeset-state.json'"
         );
     }
-    if value.get("snapshot_dir") != Some(&serde_json::json!("/var/lib/mecfeedmcp/snapshots")) {
+    if config.snapshot_dir != Path::new("/var/lib/mecfeedmcp/snapshots") {
         anyhow::bail!("config example snapshot_dir must be '/var/lib/mecfeedmcp/snapshots'");
+    }
+    if config.misp.is_some() {
+        anyhow::bail!("config example must not enable a MISP source");
     }
     Ok(())
 }
@@ -354,6 +329,8 @@ fn validate_sbom_file(package_dir: &Path) -> Result<()> {
         ("mecmcp-audit", "0.28.1"),
         ("mecmcp-auth", "0.28.1"),
         ("mecmcp-changeset", "0.28.1"),
+        ("mecmcp-http", "0.28.1"),
+        ("mecmcp-openapi", "0.28.1"),
         ("mecmcp-redact", "0.28.1"),
         ("mecmcp-runtime", "0.28.1"),
         ("mecmcp-secret", "0.28.1"),
@@ -528,14 +505,8 @@ async fn main() -> Result<()> {
 
     let config_text = fs::read_to_string(&args.device_mapping)
         .with_context(|| format!("loading {}", args.device_mapping.display()))?;
-    let config: FeedConfig = serde_json::from_str(&config_text)
+    let config = FeedConfig::parse(&config_text)
         .with_context(|| format!("parsing {}", args.device_mapping.display()))?;
-    if config.version != 1 {
-        anyhow::bail!("feed.json version must be 1");
-    }
-    if config.tenant.is_empty() {
-        anyhow::bail!("feed.json tenant must be a non-empty string");
-    }
 
     let set_scopes_pid = match args.command.as_ref() {
         Some(Command::Token {
@@ -559,7 +530,7 @@ async fn main() -> Result<()> {
         );
     }
     let state_file = cli_state_file
-        .or(config.changeset_state_file)
+        .or_else(|| config.changeset_state_file.clone())
         .context("feed.json changeset_state_file or --state-file is required")?;
     if !state_file.is_absolute() {
         anyhow::bail!("change-set state file must be an absolute path");
@@ -573,13 +544,7 @@ async fn main() -> Result<()> {
     if approval_ttl_secs == 0 {
         anyhow::bail!("approval ttl must be greater than zero");
     }
-    let policy = Policy::try_new(
-        Vec::new(),
-        Vec::new(),
-        std::iter::empty::<&str>(),
-        Limits::default(),
-    )
-    .context("default feed policy")?;
+    let policy = config.policy().context("feed.json policy")?;
     let publisher = FeedPublisher::open(
         &config.snapshot_dir,
         &state_file,
@@ -634,7 +599,23 @@ async fn main() -> Result<()> {
         .configure(audit_sink, token_store.clone())
         .context("configuring SIGHUP handler")?;
 
-    let handler = FeedHandler::new(Arc::new(publisher));
+    if let Some(path) = config.misp_key_file() {
+        validate_credential_files(&[CredentialFileSpec {
+            path,
+            role: CredentialFileRole::Secret,
+            description: "MISP API key",
+            required: true,
+        }])
+        .context("MISP API key file validation")?;
+    }
+
+    let misp = match &config.misp {
+        Some(source) => Some(Arc::new(
+            MispClient::new(source).map_err(|error| anyhow::anyhow!("{error}"))?,
+        ) as Arc<dyn mecfeedmcp::MispSource>),
+        None => None,
+    };
+    let handler = FeedHandler::with_misp(Arc::new(publisher), misp);
     match args.transport {
         Transport::Stdio => {
             let service = match handler

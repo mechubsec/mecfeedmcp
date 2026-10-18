@@ -13,6 +13,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 clap.workspace = true
 http.workspace = true
+ipnet.workspace = true
 rand.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
@@ -29,6 +30,8 @@ mecfeedmcp-core = { version = "0.1.0", path = "../mecfeedmcp-core" }
 mecmcp-audit.workspace = true
 mecmcp-auth.workspace = true
 mecmcp-changeset.workspace = true
+mecmcp-http.workspace = true
+mecmcp-openapi.workspace = true
 mecmcp-runtime.workspace = true
 mecmcp-secret.workspace = true
 mecmcp-server.workspace = true
