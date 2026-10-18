@@ -12,3 +12,4 @@
 - Validation errors bound the value they echo.
 - Each feed document is one format and one indicator kind. Junos has no domain document.
 - A name whose last two labels are a known multi-label public suffix needs one more label.
+- The MCP server publishes a snapshot only after an approved change-set digest still matches. An unapproved digest is not written.

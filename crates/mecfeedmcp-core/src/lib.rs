@@ -20,7 +20,10 @@ pub use range::{
     validate_indicator,
 };
 pub use render::{FeedFormat, RenderError, render_feed};
-pub use version::{FeedVersions, Manifest, Snapshot, SweepOutcome, VersionError};
+pub use version::{
+    FeedVersions, Manifest, PlannedSnapshot, Snapshot, SnapshotDocument, SnapshotRow, SweepOutcome,
+    VersionError,
+};
 
 /// Crate version from the workspace package.
 #[must_use]

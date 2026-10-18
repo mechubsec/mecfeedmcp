@@ -1278,6 +1278,7 @@ name = "mecfeedmcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "http",
  "mecfeedmcp-core",
@@ -1292,6 +1293,7 @@ dependencies = [
  "rmcp",
  "rustix",
  "rustls",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",
@@ -1300,6 +1302,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

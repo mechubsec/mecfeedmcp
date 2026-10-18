@@ -61,6 +61,73 @@ fn publish_one(
         .map(|_| ())
 }
 
+#[test]
+fn plan_does_not_publish_and_a_mismatched_digest_is_refused() {
+    let mut feed = FeedVersions::open(empty_policy());
+    let planned = feed
+        .plan(&proposal(vec![entry(IndicatorKind::Ip, "1.0.0.1")]), NOW)
+        .expect("plan");
+    assert!(feed.latest().is_none());
+    let err = feed
+        .commit_planned(&planned.clone().corrupt_digest(), NOW)
+        .expect_err("digest");
+    assert_eq!(err, VersionError::Digest);
+    assert!(feed.latest().is_none());
+    feed.commit_planned(&planned, NOW).expect("commit");
+    assert_eq!(
+        feed.latest().expect("latest").manifest().digest(),
+        planned.digest()
+    );
+}
+
+#[test]
+fn import_rejects_a_private_row_and_a_bad_digest() {
+    let mut feed = FeedVersions::open(empty_policy());
+    let planned = feed
+        .plan(&proposal(vec![entry(IndicatorKind::Ip, "1.0.0.1")]), NOW)
+        .expect("plan");
+    let mut document = planned.document();
+    document.digest = "ab".repeat(32);
+    let err = feed.import_document(document, NOW).expect_err("digest");
+    assert_eq!(err, VersionError::Digest);
+
+    let private = FeedIndicator::from_row(
+        IndicatorKind::Ip,
+        "10.1.1.1".to_string(),
+        "lab".to_string(),
+        50,
+        NOW,
+        NOW,
+        NOW + WEEK,
+        false,
+    );
+    let (content_digest, digest) =
+        crate::version::testing_digest(1, None, std::slice::from_ref(&private));
+    let err = feed
+        .import_document(
+            crate::version::SnapshotDocument {
+                number: 1,
+                parent: None,
+                content_digest,
+                digest,
+                entries: vec![crate::version::SnapshotRow {
+                    kind: private.kind(),
+                    value: private.value().to_string(),
+                    source: private.source().to_string(),
+                    confidence: private.confidence(),
+                    first_seen: private.first_seen(),
+                    last_seen: private.last_seen(),
+                    expires_at: private.expires_at(),
+                    broad_explicit: private.broad_explicit(),
+                }],
+            },
+            NOW,
+        )
+        .expect_err("private");
+    assert_eq!(err, VersionError::Row);
+    assert!(feed.latest().is_none());
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = Sha256::digest(bytes);
