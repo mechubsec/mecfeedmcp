@@ -11,7 +11,7 @@ use mecfeedmcp_core::{
     FeedVersions, IndicatorKind, PlannedSnapshot, Policy, Proposal, ProposedEntry,
     SnapshotDocument, SnapshotRow,
 };
-use mecmcp_audit::{ActorType, Attribution, Principal, TokenVerifiedFields};
+use mecmcp_audit::{ActorType, Attribution};
 use mecmcp_changeset::{
     ApproverIdentity, ChangeSetState, ChangesetCoordinator, CommitOptions, CommitOutcome,
     CoordinatorError, DeviceTransaction, OperationLimits, RollbackOutcome, RollbackRef,
@@ -20,7 +20,6 @@ use mecmcp_changeset::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use crate::store::{self, StoreError};
 
@@ -93,6 +92,33 @@ pub struct FeedView {
     pub digest: String,
     /// Rows.
     pub entries: Vec<SnapshotRow>,
+}
+
+/// A stored change set, shown to the approver before approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeInspection {
+    /// `publish` or `rollback`.
+    pub op: &'static str,
+    /// Principal that planned the change.
+    pub owner: String,
+    /// Lifecycle state, as the coordinator names it.
+    pub state: String,
+    /// Change-set digest an approval must name.
+    pub digest: String,
+    /// Digest the published snapshot will have.
+    pub snapshot_digest: String,
+    /// Version the change would publish.
+    pub version: u64,
+    /// Rollback target, for a rollback.
+    pub rollback_target: Option<u64>,
+    /// Approval expiry, as Unix seconds.
+    pub expires_at_unix: u64,
+    /// Rows the snapshot would hold.
+    pub entries: Vec<SnapshotRow>,
+    /// Rows in the planned snapshot and not in the current one.
+    pub added: Vec<SnapshotRow>,
+    /// Rows in the current snapshot and not in the planned one.
+    pub removed: Vec<SnapshotRow>,
 }
 
 /// Plans, approves, and publishes feed snapshots.
@@ -317,6 +343,7 @@ impl FeedPublisher {
     pub async fn apply(
         &self,
         owner: &str,
+        attribution: &Attribution,
         change_set_id: &str,
         digest: &str,
         now: i64,
@@ -327,7 +354,6 @@ impl FeedPublisher {
             inner: Arc::clone(&self.inner),
             now,
         };
-        let attribution = attribution_for(owner);
         let cancel = CancellationToken::new();
         let applied = self
             .coordinator
@@ -342,7 +368,7 @@ impl FeedPublisher {
                 "publish",
                 Some("snapshot"),
                 Some("local".to_string()),
-                &attribution,
+                attribution,
                 &cancel,
             )
             .await
@@ -372,7 +398,7 @@ impl FeedPublisher {
                 &self.policy_signature,
                 &transaction,
                 &applied.staged,
-                &attribution,
+                attribution,
                 &CommitOptions::default(),
                 &cancel,
             )
@@ -426,6 +452,79 @@ impl FeedPublisher {
             number = number.saturating_add(1);
         }
         Ok(views)
+    }
+
+    /// Read a stored change set and the snapshot it would publish, with a
+    /// diff against the current snapshot. Writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the change set is unknown, belongs to another
+    /// feed, or no longer plans against the current feed.
+    pub async fn inspect(
+        &self,
+        change_set_id: &str,
+        now: i64,
+    ) -> Result<ChangeInspection, GateError> {
+        let record = self
+            .coordinator
+            .change_set(change_set_id, &self.device)
+            .await
+            .map_err(map_coordinator)?;
+        let [stored] = record.actions.as_slice() else {
+            return Err(GateError::Admission);
+        };
+        let action: FeedAction =
+            serde_json::from_value(stored.clone()).map_err(|_| GateError::Admission)?;
+        let state = serde_json::to_value(record.state)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let (planned, current) = {
+            let inner = self.lock()?;
+            let planned =
+                plan_action(&inner.versions, &action, now).map_err(|_| GateError::Conflict)?;
+            let current = inner
+                .versions
+                .latest()
+                .and_then(|snapshot| inner.versions.document(snapshot.manifest().number()))
+                .map(|document| document.entries)
+                .unwrap_or_default();
+            (planned, current)
+        };
+        let document = planned.document();
+        let key = |row: &SnapshotRow| (kind_name(row.kind), row.value.clone());
+        let current_keys: std::collections::BTreeSet<_> = current.iter().map(key).collect();
+        let planned_keys: std::collections::BTreeSet<_> =
+            document.entries.iter().map(key).collect();
+        let added = document
+            .entries
+            .iter()
+            .filter(|row| !current_keys.contains(&key(row)))
+            .cloned()
+            .collect();
+        let removed = current
+            .iter()
+            .filter(|row| !planned_keys.contains(&key(row)))
+            .cloned()
+            .collect();
+        let (op, rollback_target) = match &action {
+            FeedAction::Publish { .. } => ("publish", None),
+            FeedAction::Rollback { target, .. } => ("rollback", Some(*target)),
+        };
+        Ok(ChangeInspection {
+            op,
+            owner: record.owner,
+            state,
+            digest: record.digest,
+            snapshot_digest: document.digest,
+            version: document.number,
+            rollback_target,
+            expires_at_unix: record.expires_at_unix,
+            entries: document.entries,
+            added,
+            removed,
+        })
     }
 
     async fn store_plan(
@@ -686,25 +785,14 @@ fn map_coordinator(error: CoordinatorError) -> GateError {
     if error.field() == "expected_digest" || message.contains("digest") {
         return GateError::Digest;
     }
-    if message.contains("fingerprint") || message.contains("no such") {
+    if message.contains("fingerprint")
+        || message.contains("no such")
+        || message.contains("unknown change set")
+        || message.contains("another device")
+    {
         return GateError::Conflict;
     }
     GateError::Store
-}
-
-fn attribution_for(owner: &str) -> Attribution {
-    Attribution {
-        principal: Principal::Token(owner.to_string()),
-        actor_type: ActorType::Human,
-        agent: None,
-        on_behalf_of: None,
-        change_ref: None,
-        request_id: Uuid::new_v4(),
-        token_verified_fields: TokenVerifiedFields::none(),
-        verified_approver: None,
-        approver: None,
-        change_set_id: None,
-    }
 }
 
 /// Parse a tool's indicator kind. Unknown kinds are refused.
@@ -781,6 +869,10 @@ mod tests {
         }
     }
 
+    fn attr() -> mecmcp_audit::Attribution {
+        mecmcp_audit::Attribution::stdio()
+    }
+
     fn other_digest() -> String {
         format!("sha256:{}", "ab".repeat(32))
     }
@@ -799,7 +891,7 @@ mod tests {
                 .await
                 .expect("approve");
             let published = publisher
-                .apply("alice", &plan.change_set_id, &plan.digest, NOW)
+                .apply("alice", &attr(), &plan.change_set_id, &plan.digest, NOW)
                 .await
                 .expect("apply");
             assert_eq!(published.digest, plan.snapshot_digest);
@@ -822,7 +914,7 @@ mod tests {
             .await
             .expect("plan");
         let err = publisher
-            .apply("alice", &plan.change_set_id, &plan.digest, NOW)
+            .apply("alice", &attr(), &plan.change_set_id, &plan.digest, NOW)
             .await
             .expect_err("apply");
         assert_eq!(err, GateError::NotApproved);
@@ -843,7 +935,7 @@ mod tests {
             .await
             .expect("approve");
         let err = publisher
-            .apply("alice", &plan.change_set_id, &other_digest(), NOW)
+            .apply("alice", &attr(), &plan.change_set_id, &other_digest(), NOW)
             .await
             .expect_err("apply");
         assert_eq!(err, GateError::Digest);
@@ -880,7 +972,7 @@ mod tests {
             .await
             .expect("waive");
         let published = publisher
-            .apply("alice", &plan.change_set_id, &plan.digest, NOW)
+            .apply("alice", &attr(), &plan.change_set_id, &plan.digest, NOW)
             .await
             .expect("apply");
         assert_eq!(published.digest, plan.snapshot_digest);
@@ -901,7 +993,7 @@ mod tests {
                 .await
                 .expect("waive");
             publisher
-                .apply("alice", &plan.change_set_id, &plan.digest, NOW)
+                .apply("alice", &attr(), &plan.change_set_id, &plan.digest, NOW)
                 .await
                 .expect("apply")
                 .digest
@@ -937,7 +1029,7 @@ mod tests {
             .await
             .expect("waive 1");
         publisher
-            .apply("alice", &first.change_set_id, &first.digest, NOW)
+            .apply("alice", &attr(), &first.change_set_id, &first.digest, NOW)
             .await
             .expect("apply 1");
         let second = publisher
@@ -949,7 +1041,7 @@ mod tests {
             .await
             .expect("waive 2");
         publisher
-            .apply("alice", &second.change_set_id, &second.digest, NOW)
+            .apply("alice", &attr(), &second.change_set_id, &second.digest, NOW)
             .await
             .expect("apply 2");
         let rollback = publisher
@@ -961,7 +1053,13 @@ mod tests {
             .await
             .expect("waive rollback");
         let published = publisher
-            .apply("alice", &rollback.change_set_id, &rollback.digest, NOW)
+            .apply(
+                "alice",
+                &attr(),
+                &rollback.change_set_id,
+                &rollback.digest,
+                NOW,
+            )
             .await
             .expect("apply rollback");
         assert_eq!(published.version, 3);
@@ -975,5 +1073,135 @@ mod tests {
                 .trim(),
             "3"
         );
+    }
+
+    async fn planned(publisher: &FeedPublisher) -> super::PlanReceipt {
+        publisher
+            .plan("alice", one("1.0.0.1"), NOW)
+            .await
+            .expect("plan")
+    }
+
+    #[tokio::test]
+    async fn non_human_approve_is_refused_and_writes_nothing() {
+        let fix = fixture();
+        let publisher = open(&fix, false);
+        let plan = planned(&publisher).await;
+        let err = publisher
+            .approve("bob", false, &plan.change_set_id, &plan.digest)
+            .await
+            .expect_err("approve");
+        assert_eq!(err, GateError::NotHuman);
+        let err = publisher
+            .apply("alice", &attr(), &plan.change_set_id, &plan.digest, NOW)
+            .await
+            .expect_err("apply");
+        assert_eq!(err, GateError::NotApproved);
+        assert!(publisher.latest().expect("lock").is_none());
+    }
+
+    #[tokio::test]
+    async fn waive_with_lab_mode_off_is_refused() {
+        let fix = fixture();
+        let publisher = open(&fix, false);
+        let plan = planned(&publisher).await;
+        let err = publisher
+            .waive("alice", &plan.change_set_id, &plan.digest)
+            .await
+            .expect_err("waive");
+        assert_eq!(err, GateError::NotApproved);
+        let err = publisher
+            .apply("alice", &attr(), &plan.change_set_id, &plan.digest, NOW)
+            .await
+            .expect_err("apply");
+        assert_eq!(err, GateError::NotApproved);
+        assert!(publisher.latest().expect("lock").is_none());
+    }
+
+    #[tokio::test]
+    async fn waive_by_a_non_owner_is_refused() {
+        let fix = fixture();
+        let publisher = open(&fix, true);
+        let plan = planned(&publisher).await;
+        let err = publisher
+            .waive("mallory", &plan.change_set_id, &plan.digest)
+            .await
+            .expect_err("waive");
+        assert_eq!(err, GateError::NotOwner);
+        assert!(publisher.latest().expect("lock").is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_by_a_non_owner_is_refused() {
+        let fix = fixture();
+        let publisher = open(&fix, false);
+        let plan = planned(&publisher).await;
+        publisher
+            .approve("bob", true, &plan.change_set_id, &plan.digest)
+            .await
+            .expect("approve");
+        let err = publisher
+            .apply("mallory", &attr(), &plan.change_set_id, &plan.digest, NOW)
+            .await
+            .expect_err("apply");
+        assert_eq!(err, GateError::NotOwner);
+        assert!(publisher.latest().expect("lock").is_none());
+    }
+
+    #[tokio::test]
+    async fn replayed_apply_is_refused() {
+        let fix = fixture();
+        let publisher = open(&fix, false);
+        let plan = planned(&publisher).await;
+        publisher
+            .approve("bob", true, &plan.change_set_id, &plan.digest)
+            .await
+            .expect("approve");
+        publisher
+            .apply("alice", &attr(), &plan.change_set_id, &plan.digest, NOW)
+            .await
+            .expect("apply");
+        let err = publisher
+            .apply("alice", &attr(), &plan.change_set_id, &plan.digest, NOW)
+            .await
+            .expect_err("replay");
+        assert_eq!(err, GateError::NotApproved);
+        assert_eq!(publisher.history().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn inspect_shows_rows_and_diff_without_writing() {
+        let fix = fixture();
+        let publisher = open(&fix, false);
+        let first = planned(&publisher).await;
+        publisher
+            .approve("bob", true, &first.change_set_id, &first.digest)
+            .await
+            .expect("approve");
+        publisher
+            .apply("alice", &attr(), &first.change_set_id, &first.digest, NOW)
+            .await
+            .expect("apply");
+        let second = publisher
+            .plan("alice", one("1.0.0.2"), NOW)
+            .await
+            .expect("plan");
+        let view = publisher
+            .inspect(&second.change_set_id, NOW)
+            .await
+            .expect("inspect");
+        assert_eq!(view.op, "publish");
+        assert_eq!(view.owner, "alice");
+        assert_eq!(view.digest, second.digest);
+        assert_eq!(view.snapshot_digest, second.snapshot_digest);
+        assert_eq!(view.version, 2);
+        assert!(view.added.iter().any(|row| row.value == "1.0.0.2"));
+        assert!(view.entries.iter().any(|row| row.value == "1.0.0.2"));
+        assert_eq!(publisher.history().expect("lock").len(), 1);
+        let err = publisher
+            .inspect(&"0".repeat(64), NOW)
+            .await
+            .expect_err("unknown");
+        assert_eq!(err, GateError::Conflict);
     }
 }

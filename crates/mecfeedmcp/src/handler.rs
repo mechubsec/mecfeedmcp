@@ -6,7 +6,8 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use mecfeedmcp_core::{IndicatorKind, Proposal, ProposedEntry};
+use mecfeedmcp_core::{IndicatorKind, Proposal, ProposedEntry, SnapshotRow};
+use mecmcp_audit::{Attribution, AuditScope};
 use mecmcp_auth::{ActorType, CallerCtx, NoGrant};
 use rmcp::{
     ServerHandler,
@@ -24,11 +25,41 @@ use tokio_util::sync::CancellationToken;
 
 use crate::gate::{self, FeedPublisher, FeedView};
 
+/// Unwrap an authorization result, or audit a denial and return it.
 macro_rules! admit {
-    ($result:expr) => {
+    ($audit:ident, $result:expr) => {
         match $result {
             Ok(value) => value,
-            Err(denial) => return Ok(denial),
+            Err(denial) => {
+                $audit.deny("not_authorized");
+                return Ok(denial);
+            }
+        }
+    };
+}
+
+/// Unwrap a gate result, or audit the failure and return its fixed text.
+macro_rules! gated {
+    ($audit:ident, $result:expr) => {
+        match $result {
+            Ok(value) => value,
+            Err(error) => {
+                $audit.fail(&error);
+                return Ok(gate_text(error));
+            }
+        }
+    };
+}
+
+/// Unwrap a request-validation result, or audit the failure and return it.
+macro_rules! valid {
+    ($audit:ident, $result:expr) => {
+        match $result {
+            Ok(value) => value,
+            Err(refusal) => {
+                $audit.fail("request is not acceptable");
+                return Ok(refusal);
+            }
         }
     };
 }
@@ -37,6 +68,7 @@ macro_rules! admit {
 pub const KNOWN_TOOLS: &[&str] = &[
     "get_feed",
     "get_feed_history",
+    "get_feed_change",
     "plan_feed_change",
     "approve_feed_change",
     "apply_feed_change",
@@ -73,6 +105,33 @@ impl FeedHandler {
             .get::<http::request::Parts>()
             .and_then(|parts| parts.extensions.get::<CallerCtx<NoGrant>>())
             .cloned()
+    }
+
+    /// Attribution for `caller`, or the unauthenticated one when absent.
+    fn attribution(
+        caller: Option<&CallerCtx<NoGrant>>,
+        change_set_id: Option<&str>,
+    ) -> Attribution {
+        let mut attribution = caller.map_or_else(Attribution::stdio, Attribution::from_caller);
+        if let Some(id) = change_set_id {
+            attribution.with_change_set(id, None);
+        }
+        attribution
+    }
+
+    /// Open the audit scope for one tool call. The feed is the audited device.
+    fn scope(
+        &self,
+        attribution: &Attribution,
+        tool: &'static str,
+        action: &'static str,
+    ) -> AuditScope {
+        AuditScope::new(
+            attribution.clone(),
+            tool,
+            action,
+            vec![self.publisher.device().to_string()],
+        )
     }
 
     #[allow(clippy::result_large_err)]
@@ -170,6 +229,14 @@ pub struct ChangeSetDigestInput {
     pub digest: String,
 }
 
+/// Arguments that name one stored change set.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeSetIdInput {
+    /// Change-set id returned by the plan.
+    pub change_set_id: String,
+}
+
 /// Arguments for [`FeedHandler::rollback_feed`].
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -193,16 +260,20 @@ impl FeedHandler {
         extensions: Extensions,
         _cancellation: CancellationToken,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        admit!(self.authorize(&extensions, "get_feed", false));
+        let attribution = Self::attribution(Self::caller(&extensions).as_ref(), None);
+        let mut audit = self.scope(&attribution, "get_feed", "read");
+        admit!(audit, self.authorize(&extensions, "get_feed", false));
         let view = match input.version {
-            Some(number) => admit!(self.publisher.history().map_err(gate_text))
+            Some(number) => gated!(audit, self.publisher.history())
                 .into_iter()
                 .find(|view| view.version == number),
-            None => admit!(self.publisher.latest().map_err(gate_text)),
+            None => gated!(audit, self.publisher.latest()),
         };
         let Some(view) = view else {
+            audit.fail("snapshot was not found");
             return error("snapshot was not found");
         };
+        audit.succeed();
         success(&view_json(&view))
     }
 
@@ -217,10 +288,56 @@ impl FeedHandler {
         extensions: Extensions,
         _cancellation: CancellationToken,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        admit!(self.authorize(&extensions, "get_feed_history", false));
-        let views = admit!(self.publisher.history().map_err(gate_text));
+        let attribution = Self::attribution(Self::caller(&extensions).as_ref(), None);
+        let mut audit = self.scope(&attribution, "get_feed_history", "read");
+        admit!(
+            audit,
+            self.authorize(&extensions, "get_feed_history", false)
+        );
+        let views = gated!(audit, self.publisher.history());
+        audit.succeed();
         success(&json!({
             "snapshots": views.iter().map(view_json).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Read a stored change set, for the approver.
+    #[tool(
+        name = "get_feed_change",
+        description = "Read a stored feed change set without changing it: the planned rows, the rollback target, the snapshot and change-set digests, the owner, the approval expiry, and the rows added and removed against the current snapshot. The approver reads this before approve_feed_change"
+    )]
+    async fn get_feed_change(
+        &self,
+        Parameters(input): Parameters<ChangeSetIdInput>,
+        extensions: Extensions,
+        _cancellation: CancellationToken,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let attribution = Self::attribution(
+            Self::caller(&extensions).as_ref(),
+            Some(&input.change_set_id),
+        );
+        let mut audit = self.scope(&attribution, "get_feed_change", "read");
+        admit!(audit, self.authorize(&extensions, "get_feed_change", false));
+        let now = valid!(audit, unix_now());
+        let change = gated!(
+            audit,
+            self.publisher.inspect(&input.change_set_id, now).await
+        );
+        audit.meta("digest", change.digest.clone());
+        audit.succeed();
+        success(&json!({
+            "change_set_id": input.change_set_id,
+            "op": change.op,
+            "owner": change.owner,
+            "state": change.state,
+            "digest": change.digest,
+            "snapshot_digest": change.snapshot_digest,
+            "version": change.version,
+            "rollback_target": change.rollback_target,
+            "approval_expires_at": change.expires_at_unix,
+            "entries": change.entries.iter().map(row_json).collect::<Vec<_>>(),
+            "added": change.added.iter().map(row_json).collect::<Vec<_>>(),
+            "removed": change.removed.iter().map(row_json).collect::<Vec<_>>(),
         }))
     }
 
@@ -235,15 +352,19 @@ impl FeedHandler {
         extensions: Extensions,
         _cancellation: CancellationToken,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let caller = admit!(self.require_writer(&extensions, "plan_feed_change"));
-        let now = admit!(unix_now());
-        let proposal = admit!(proposal_from(&input.entries));
-        let receipt = admit!(
-            self.publisher
-                .plan(&caller.token_name, proposal, now)
-                .await
-                .map_err(gate_text)
+        let attribution = Self::attribution(Self::caller(&extensions).as_ref(), None);
+        let mut audit = self.scope(&attribution, "plan_feed_change", "plan");
+        let caller = admit!(audit, self.require_writer(&extensions, "plan_feed_change"));
+        let now = valid!(audit, unix_now());
+        let proposal = valid!(audit, proposal_from(&input.entries));
+        let receipt = gated!(
+            audit,
+            self.publisher.plan(&caller.token_name, proposal, now).await
         );
+        audit.meta("change_set_id", receipt.change_set_id.clone());
+        audit.meta("digest", receipt.digest.clone());
+        audit.meta("version", receipt.version);
+        audit.succeed();
         success(&json!({
             "change_set_id": receipt.change_set_id,
             "digest": receipt.digest,
@@ -258,7 +379,7 @@ impl FeedHandler {
     /// In lab mode the owner records a waiver.
     #[tool(
         name = "approve_feed_change",
-        description = "Approve one stored feed digest. Production requires a different human principal. Lab mode records a waiver by the owner"
+        description = "Approve one stored feed digest. Read get_feed_change for the change set first: approve only rows you have read. Production requires a different human principal. Lab mode records a waiver by the owner"
     )]
     async fn approve_feed_change(
         &self,
@@ -266,8 +387,23 @@ impl FeedHandler {
         extensions: Extensions,
         _cancellation: CancellationToken,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let caller = admit!(self.require_writer(&extensions, "approve_feed_change"));
-        let result = if self.publisher.lab_mode() {
+        let waive = self.publisher.lab_mode();
+        let attribution = Self::attribution(
+            Self::caller(&extensions).as_ref(),
+            Some(&input.change_set_id),
+        );
+        let mut audit = self.scope(
+            &attribution,
+            "approve_feed_change",
+            if waive { "waive" } else { "approve" },
+        );
+        audit.meta("change_set_id", input.change_set_id.clone());
+        audit.meta("digest", input.digest.clone());
+        let caller = admit!(
+            audit,
+            self.require_writer(&extensions, "approve_feed_change")
+        );
+        let result = if waive {
             self.publisher
                 .waive(&caller.token_name, &input.change_set_id, &input.digest)
                 .await
@@ -281,7 +417,8 @@ impl FeedHandler {
                 )
                 .await
         };
-        admit!(result.map_err(gate_text));
+        gated!(audit, result);
+        audit.succeed();
         success(&json!({ "approved": true }))
     }
 
@@ -296,14 +433,30 @@ impl FeedHandler {
         extensions: Extensions,
         _cancellation: CancellationToken,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let caller = admit!(self.require_writer(&extensions, "apply_feed_change"));
-        let now = admit!(unix_now());
-        let published = admit!(
-            self.publisher
-                .apply(&caller.token_name, &input.change_set_id, &input.digest, now)
-                .await
-                .map_err(gate_text)
+        let attribution = Self::attribution(
+            Self::caller(&extensions).as_ref(),
+            Some(&input.change_set_id),
         );
+        let mut audit = self.scope(&attribution, "apply_feed_change", "apply");
+        audit.meta("change_set_id", input.change_set_id.clone());
+        audit.meta("digest", input.digest.clone());
+        let caller = admit!(audit, self.require_writer(&extensions, "apply_feed_change"));
+        let now = valid!(audit, unix_now());
+        let published = gated!(
+            audit,
+            self.publisher
+                .apply(
+                    &caller.token_name,
+                    &attribution,
+                    &input.change_set_id,
+                    &input.digest,
+                    now,
+                )
+                .await
+        );
+        audit.meta("published_version", published.version);
+        audit.meta("snapshot_digest", published.digest.clone());
+        audit.succeed();
         success(&json!({
             "version": published.version,
             "digest": published.digest,
@@ -321,14 +474,20 @@ impl FeedHandler {
         extensions: Extensions,
         _cancellation: CancellationToken,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let caller = admit!(self.require_writer(&extensions, "rollback_feed"));
-        let now = admit!(unix_now());
-        let receipt = admit!(
+        let attribution = Self::attribution(Self::caller(&extensions).as_ref(), None);
+        let mut audit = self.scope(&attribution, "rollback_feed", "rollback");
+        audit.meta("target", input.target);
+        let caller = admit!(audit, self.require_writer(&extensions, "rollback_feed"));
+        let now = valid!(audit, unix_now());
+        let receipt = gated!(
+            audit,
             self.publisher
-                .stage_rollback(&caller.token_name, input.target, input.expected_latest, now,)
+                .stage_rollback(&caller.token_name, input.target, input.expected_latest, now)
                 .await
-                .map_err(gate_text)
         );
+        audit.meta("change_set_id", receipt.change_set_id.clone());
+        audit.meta("digest", receipt.digest.clone());
+        audit.succeed();
         success(&json!({
             "change_set_id": receipt.change_set_id,
             "digest": receipt.digest,
@@ -346,6 +505,8 @@ impl ServerHandler for FeedHandler {
             .with_instructions(
                 "mecfeedmcp publishes versioned threat-intel feed snapshots. \
                  plan_feed_change admits a proposal and stores a digest. \
+                 get_feed_change shows the approver the planned rows and the diff against the current snapshot; \
+                 the approver reads it before approve_feed_change. \
                  approve_feed_change records a different human principal, or a lab-mode waiver by the owner. \
                  apply_feed_change publishes that exact digest. \
                  rollback_feed plans a republish of an earlier snapshot; apply publishes it. \
@@ -379,16 +540,20 @@ fn view_json(view: &FeedView) -> serde_json::Value {
     json!({
         "version": view.version,
         "digest": view.digest,
-        "entries": view.entries.iter().map(|entry| json!({
-            "kind": kind_name(entry.kind),
-            "value": entry.value,
-            "source": entry.source,
-            "confidence": entry.confidence,
-            "first_seen": entry.first_seen,
-            "last_seen": entry.last_seen,
-            "expires_at": entry.expires_at,
-            "broad_explicit": entry.broad_explicit,
-        })).collect::<Vec<_>>(),
+        "entries": view.entries.iter().map(row_json).collect::<Vec<_>>(),
+    })
+}
+
+fn row_json(entry: &SnapshotRow) -> serde_json::Value {
+    json!({
+        "kind": kind_name(entry.kind),
+        "value": entry.value,
+        "source": entry.source,
+        "confidence": entry.confidence,
+        "first_seen": entry.first_seen,
+        "last_seen": entry.last_seen,
+        "expires_at": entry.expires_at,
+        "broad_explicit": entry.broad_explicit,
     })
 }
 
@@ -426,4 +591,246 @@ fn error(text: &str) -> Result<CallToolResult, rmcp::ErrorData> {
 
 fn error_result(text: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(text.into())])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use mecfeedmcp_core::{Limits, Policy};
+    use mecmcp_auth::ScopeSet;
+
+    use super::*;
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        publisher: Arc<FeedPublisher>,
+        handler: FeedHandler,
+    }
+
+    fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let policy = Policy::try_new(
+            Vec::new(),
+            Vec::new(),
+            std::iter::empty::<&str>(),
+            Limits::default(),
+        )
+        .expect("policy");
+        let publisher = Arc::new(
+            FeedPublisher::open(
+                &dir.path().join("snapshots"),
+                &dir.path().join("changeset-state.json"),
+                policy,
+                "lab",
+                false,
+                Duration::from_secs(900),
+            )
+            .expect("open"),
+        );
+        Fixture {
+            handler: FeedHandler::new(Arc::clone(&publisher)),
+            publisher,
+            _dir: dir,
+        }
+    }
+
+    fn ctx(name: &str, actor_type: ActorType) -> CallerCtx<NoGrant> {
+        CallerCtx {
+            token_name: name.into(),
+            devices: ScopeSet::Wildcard,
+            tools: ScopeSet::Allowlist(KNOWN_TOOLS.iter().map(|t| (*t).to_string()).collect()),
+            grant: None,
+            provider: None,
+            provider_tier: None,
+            on_behalf_of: None,
+            actor_type,
+            oidc_subject: None,
+            verified_approver: None,
+            client_name: None,
+            model_id: None,
+            session_id: None,
+            request_id: uuid::Uuid::new_v4(),
+        }
+    }
+
+    fn extensions(caller: Option<CallerCtx<NoGrant>>) -> Extensions {
+        let mut extensions = Extensions::new();
+        if let Some(caller) = caller {
+            let (mut parts, ()) = http::Request::new(()).into_parts();
+            parts.extensions.insert(caller);
+            extensions.insert(parts);
+        }
+        extensions
+    }
+
+    fn is_error(result: &CallToolResult) -> bool {
+        result.is_error == Some(true)
+    }
+
+    fn plan_input() -> PlanFeedChangeInput {
+        PlanFeedChangeInput {
+            entries: vec![PlanEntryInput {
+                kind: "ip".to_string(),
+                value: "1.0.0.1".to_string(),
+                source: "lab".to_string(),
+                confidence: 50,
+                first_seen: 1_700_000_000,
+                last_seen: 1_700_000_000,
+                expires_at: None,
+                allow_broad_prefix: false,
+            }],
+        }
+    }
+
+    async fn plan_as(f: &Fixture, caller: CallerCtx<NoGrant>) -> (String, String) {
+        let result = f
+            .handler
+            .plan_feed_change(
+                Parameters(plan_input()),
+                extensions(Some(caller)),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("call");
+        assert!(!is_error(&result), "plan was refused");
+        let text = format!("{:?}", result.content);
+        let field = |name: &str| {
+            let start = text.find(name).expect("field") + name.len();
+            let rest = &text[start..];
+            let end = rest.find("\\\"").expect("end");
+            rest[..end].to_string()
+        };
+        (field("change_set_id\\\": \\\""), field("digest\\\": \\\""))
+    }
+
+    #[tokio::test]
+    async fn write_without_a_caller_fails_closed() {
+        let f = fixture();
+        let result = f
+            .handler
+            .plan_feed_change(
+                Parameters(plan_input()),
+                extensions(None),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("call");
+        assert!(is_error(&result));
+        let result = f
+            .handler
+            .rollback_feed(
+                Parameters(RollbackFeedInput {
+                    target: 1,
+                    expected_latest: 1,
+                }),
+                extensions(None),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("call");
+        assert!(is_error(&result));
+        assert!(f.publisher.history().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn wildcard_tool_scope_excludes_writes() {
+        let f = fixture();
+        let mut caller = ctx("alice", ActorType::Human);
+        caller.tools = ScopeSet::Wildcard;
+        let result = f
+            .handler
+            .plan_feed_change(
+                Parameters(plan_input()),
+                extensions(Some(caller)),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("call");
+        assert!(is_error(&result));
+    }
+
+    #[tokio::test]
+    async fn device_scope_mismatch_is_refused() {
+        let f = fixture();
+        let mut caller = ctx("alice", ActorType::Human);
+        caller.devices = ScopeSet::Allowlist(vec!["other".to_string()]);
+        let result = f
+            .handler
+            .plan_feed_change(
+                Parameters(plan_input()),
+                extensions(Some(caller.clone())),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("call");
+        assert!(is_error(&result));
+        let result = f
+            .handler
+            .get_feed(
+                Parameters(GetFeedInput::default()),
+                extensions(Some(caller)),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("call");
+        assert!(is_error(&result));
+    }
+
+    #[tokio::test]
+    async fn non_human_token_cannot_approve() {
+        let f = fixture();
+        let (id, digest) = plan_as(&f, ctx("alice", ActorType::Human)).await;
+        let input = || {
+            Parameters(ChangeSetDigestInput {
+                change_set_id: id.clone(),
+                digest: digest.clone(),
+            })
+        };
+        let result = f
+            .handler
+            .approve_feed_change(
+                input(),
+                extensions(Some(ctx("bot", ActorType::Agent))),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("call");
+        assert!(is_error(&result));
+        let result = f
+            .handler
+            .apply_feed_change(
+                input(),
+                extensions(Some(ctx("alice", ActorType::Human))),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("call");
+        assert!(is_error(&result));
+        assert!(f.publisher.latest().expect("lock").is_none());
+    }
+
+    #[tokio::test]
+    async fn approver_can_read_the_change_set_before_approving() {
+        let f = fixture();
+        let (id, _) = plan_as(&f, ctx("alice", ActorType::Human)).await;
+        let result = f
+            .handler
+            .get_feed_change(
+                Parameters(ChangeSetIdInput { change_set_id: id }),
+                extensions(Some(ctx("bob", ActorType::Human))),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("call");
+        assert!(!is_error(&result));
+        assert!(format!("{:?}", result.content).contains("1.0.0.1"));
+        assert!(f.publisher.latest().expect("lock").is_none());
+    }
+
+    #[test]
+    fn get_feed_change_is_read_only() {
+        assert!(KNOWN_TOOLS.contains(&"get_feed_change"));
+        assert!(!WRITE_TOOLS.contains(&"get_feed_change"));
+    }
 }
