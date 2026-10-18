@@ -14,3 +14,4 @@
 - A name whose last two labels are a known multi-label public suffix needs one more label.
 - The MCP server publishes a snapshot only after an approved change-set digest still matches. An unapproved digest is not written.
 - Feed change-control writes an audit event, and the actor type comes from the caller token. `get_feed_change` shows the canonical rows and the diff against the current snapshot, and refuses the preview when that snapshot no longer matches the stored plan.
+- `list_indicators` and `search_indicators` read mapped MISP attributes over HTTPS. The API key is a file or environment reference. Operator prefix and domain allowlists load from `feed.json`.

@@ -221,6 +221,15 @@ impl FeedPublisher {
         &self.device
     }
 
+    /// Per-change entry cap from the loaded policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the feed lock is unavailable.
+    pub fn max_entries(&self) -> Result<usize, GateError> {
+        Ok(self.lock()?.versions.policy().max_entries())
+    }
+
     /// Validate `proposal` and store it. Nothing is published.
     ///
     /// # Errors

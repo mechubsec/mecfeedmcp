@@ -1,8 +1,8 @@
 # Operations
 
-> 🚧 **Under construction.** The MCP server publishes an approved snapshot.
-> `mecfeed-serve` does not serve snapshots yet. Do not point production
-> firewalls at it.
+> 🚧 **Under construction.** The MCP server publishes an approved snapshot
+> and can read MISP. `mecfeed-serve` does not serve snapshots yet. Do not
+> point production firewalls at it.
 
 The shared `mecmcp` crates are pinned — to `v0.28.1`.
 
@@ -45,3 +45,9 @@ Match the rest of the mecmcp fleet: bearer tokens in
 binary generates `/var/lib/mecfeedmcp/audit-hmac.key` on first start if it
 is absent. Each plan, approval, waiver, publish, and rollback writes an
 audit event. The approver reads `get_feed_change` before `approve_feed_change`.
+
+`feed.json` holds operator prefix and domain allowlists. It never holds a
+MISP API key. Name the key with `misp.api_key_env` or `misp.api_key_file`
+(absolute path, mode `0600`). `misp.base_url` is an `https://` origin only.
+`list_indicators` and `search_indicators` read mapped MISP attributes; they
+do not plan or publish. OpenCTI is not wired.
