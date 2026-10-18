@@ -1,6 +1,6 @@
 //! Streamable HTTP transport wiring for the empty feed MCP server.
 
-use crate::FeedHandler;
+use crate::{FeedHandler, WRITE_TOOLS};
 use anyhow::{Context, Result};
 use mecmcp_auth::{BearerSyntax, CallerCtx, NoGrant, TokenStoreFile};
 use mecmcp_transport::{
@@ -12,8 +12,7 @@ use mecmcp_transport::{
 use std::{net::SocketAddr, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
-/// Build the shared HTTP router. No tools are registered yet, so the
-/// preflight exclusion list is empty.
+/// Build the shared HTTP router. Wildcard tool scopes exclude write tools.
 #[allow(clippy::too_many_arguments)]
 pub fn build_http_router(
     handler: FeedHandler,
@@ -35,7 +34,7 @@ pub fn build_http_router(
             snapshot.authenticate(candidate).map(CallerCtx::from)
         });
         let preflight = ToolScopePreflight::new(
-            &[],
+            WRITE_TOOLS,
             [TargetField::scalar("tenant")],
             MalformedArgumentsPolicy::Deny,
         );

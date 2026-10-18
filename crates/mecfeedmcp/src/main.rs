@@ -2,8 +2,10 @@
 
 use anyhow::{Context, Result};
 use mecfeedmcp::{
-    FeedHandler, KNOWN_TOOLS, SighupHandler, install_early_sighup_handler, serve_http,
+    FeedHandler, FeedPublisher, KNOWN_TOOLS, SighupHandler, install_early_sighup_handler,
+    serve_http,
 };
+use mecfeedmcp_core::{Limits, Policy};
 use mecmcp_auth::{NoGrant, TokenStoreFile};
 use mecmcp_runtime::cli::{Cli, Command, ParsedCli, Transport};
 use mecmcp_secret::naming::ServerNaming;
@@ -68,12 +70,18 @@ struct ServerCli {
 
 const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 900;
 
+fn default_snapshot_dir() -> PathBuf {
+    PathBuf::from("/var/lib/mecfeedmcp/snapshots")
+}
+
 #[derive(Debug, Deserialize)]
 struct FeedConfig {
     version: u32,
     tenant: String,
     #[serde(default)]
     changeset_state_file: Option<PathBuf>,
+    #[serde(default = "default_snapshot_dir")]
+    snapshot_dir: PathBuf,
     #[serde(default)]
     approval_ttl_secs: Option<u64>,
 }
@@ -237,6 +245,9 @@ fn validate_config_file(package_dir: &Path) -> Result<()> {
         anyhow::bail!(
             "config example changeset_state_file must be '/var/lib/mecfeedmcp/changeset-state.json'"
         );
+    }
+    if value.get("snapshot_dir") != Some(&serde_json::json!("/var/lib/mecfeedmcp/snapshots")) {
+        anyhow::bail!("config example snapshot_dir must be '/var/lib/mecfeedmcp/snapshots'");
     }
     Ok(())
 }
@@ -544,15 +555,40 @@ async fn main() -> Result<()> {
 
     if lab_mode {
         tracing::warn!(
-            "--lab-mode: two-person control is DISABLED. This skeleton does not yet \
-             implement change sets; the flag is accepted so the packaged CLI surface \
-             matches the rest of the fleet."
+            "--lab-mode: the change-set owner records a waiver. A second principal is not required."
         );
     }
-    let _state_file = cli_state_file.or(config.changeset_state_file);
-    let _approval_ttl_secs = config
+    let state_file = cli_state_file
+        .or(config.changeset_state_file)
+        .context("feed.json changeset_state_file or --state-file is required")?;
+    if !state_file.is_absolute() {
+        anyhow::bail!("change-set state file must be an absolute path");
+    }
+    if !config.snapshot_dir.is_absolute() {
+        anyhow::bail!("feed.json snapshot_dir must be an absolute path");
+    }
+    let approval_ttl_secs = config
         .approval_ttl_secs
         .unwrap_or(cli_approval_timeout_secs);
+    if approval_ttl_secs == 0 {
+        anyhow::bail!("approval ttl must be greater than zero");
+    }
+    let policy = Policy::try_new(
+        Vec::new(),
+        Vec::new(),
+        std::iter::empty::<&str>(),
+        Limits::default(),
+    )
+    .context("default feed policy")?;
+    let publisher = FeedPublisher::open(
+        &config.snapshot_dir,
+        &state_file,
+        policy,
+        &config.tenant,
+        lab_mode,
+        Duration::from_secs(approval_ttl_secs),
+    )
+    .map_err(|error| anyhow::anyhow!("opening the feed publisher: {error}"))?;
 
     if args
         .evidence
@@ -560,10 +596,7 @@ async fn main() -> Result<()> {
         .map_err(anyhow::Error::msg)?
         .is_some()
     {
-        anyhow::bail!(
-            "SSDF evidence flags are not wired in this empty skeleton; omit them until the \
-             change-set lifecycle ships"
-        );
+        anyhow::bail!("SSDF evidence flags are not wired yet; omit them");
     }
 
     let provider = rustls::crypto::ring::default_provider();
@@ -601,7 +634,7 @@ async fn main() -> Result<()> {
         .configure(audit_sink, token_store.clone())
         .context("configuring SIGHUP handler")?;
 
-    let handler = FeedHandler;
+    let handler = FeedHandler::new(Arc::new(publisher));
     match args.transport {
         Transport::Stdio => {
             let service = match handler

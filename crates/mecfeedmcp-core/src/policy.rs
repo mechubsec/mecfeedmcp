@@ -193,6 +193,29 @@ impl FeedIndicator {
         self.broad_explicit
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_row(
+        kind: IndicatorKind,
+        value: String,
+        source: String,
+        confidence: u8,
+        first_seen: i64,
+        last_seen: i64,
+        expires_at: i64,
+        broad_explicit: bool,
+    ) -> Self {
+        Self {
+            kind,
+            value,
+            source,
+            confidence,
+            first_seen,
+            last_seen,
+            expires_at,
+            broad_explicit,
+        }
+    }
+
     /// Stable kind tag used in the snapshot digest.
     #[must_use]
     pub fn kind_tag(&self) -> &'static str {
@@ -361,6 +384,14 @@ pub(crate) fn screen(entry: &FeedIndicator, policy: &Policy, now: i64) -> Result
     if entry.expires_at <= now {
         return Err(EntryError::Expiry);
     }
+    screen_stored(entry, policy)
+}
+
+/// Re-check a stored row without applying the expiry clock.
+///
+/// History must still load after a row's lifetime has passed. Expiry is
+/// enforced when the row is rendered or carried into a new version.
+pub(crate) fn screen_stored(entry: &FeedIndicator, policy: &Policy) -> Result<(), EntryError> {
     let indicator = Indicator {
         kind: entry.kind,
         value: entry.value.clone(),

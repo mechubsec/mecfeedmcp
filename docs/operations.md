@@ -1,8 +1,8 @@
 # Operations
 
-> 🚧 **Under construction.** This package installs empty skeleton binaries.
-> Do not point production firewalls at `mecfeed-serve`, and do not use
-> `mecfeedmcp` as a change-control path until a later phase registers tools.
+> 🚧 **Under construction.** The MCP server publishes an approved snapshot.
+> `mecfeed-serve` does not serve snapshots yet. Do not point production
+> firewalls at it.
 
 The shared `mecmcp` crates are pinned — to `v0.28.1`.
 
@@ -15,8 +15,10 @@ The shared `mecmcp` crates are pinned — to `v0.28.1`.
 | `/etc/mecfeedmcp/feed.json` | operator-authored feed config (no secrets) |
 | `/var/lib/mecfeedmcp/tokens.json` | bearer-token store |
 | `/var/lib/mecfeedmcp/audit-hmac.key` | audit HMAC key (generated on first run) |
+| `/var/lib/mecfeedmcp/changeset-state.json` | change-set state |
+| `/var/lib/mecfeedmcp/snapshots` | snapshots written by the MCP server |
 | `/etc/mecfeed-serve/tls.crt`, `tls.key` | feed-server TLS material |
-| `/var/lib/mecfeed-serve/snapshots` | published feed snapshots (empty in this phase) |
+| `/var/lib/mecfeed-serve/snapshots` | feed-server snapshot directory (not served yet) |
 
 The installer never enables either unit. Create config and credentials first,
 then `systemctl enable --now mecfeedmcp.service` (and `mecfeed-serve.service`
@@ -41,4 +43,5 @@ loopback-only allowlist rejects every client. Use host networking, or pass
 Match the rest of the mecmcp fleet: bearer tokens in
 `/var/lib/mecfeedmcp/tokens.json` mode `0600`, owned by `mecfeedmcp`. The
 binary generates `/var/lib/mecfeedmcp/audit-hmac.key` on first start if it
-is absent.
+is absent. Each plan, approval, waiver, publish, and rollback writes an
+audit event. The approver reads `get_feed_change` before `approve_feed_change`.
