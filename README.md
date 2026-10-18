@@ -62,7 +62,7 @@ Only what is strictly necessary lives elsewhere:
 
 ## Status
 
-**Under construction — not usable.** P0 (workspace, CI, and release pipeline, [#1](https://github.com/mechubsec/mecfeedmcp/issues/1)) is on `main`. `mecfeedmcp-core` admits indicators, versions snapshots, and renders feed documents ([#2](https://github.com/mechubsec/mecfeedmcp/issues/2)). The MCP server plans, approves, and publishes a snapshot ([#3](https://github.com/mechubsec/mecfeedmcp/issues/3)). MISP is not read yet, and `mecfeed-serve` still does not serve snapshots. Scope history: [mecmcp#424](https://github.com/mechubsec/mecmcp/issues/424). Work is tracked in this repo's issues.
+**Under construction — not usable.** P0 (workspace, CI, and release pipeline, [#1](https://github.com/mechubsec/mecfeedmcp/issues/1)) is on `main`. `mecfeedmcp-core` admits indicators, versions snapshots, and renders feed documents ([#2](https://github.com/mechubsec/mecfeedmcp/issues/2)). The MCP server plans, approves, and publishes a snapshot ([#3](https://github.com/mechubsec/mecfeedmcp/issues/3)). The approver reads `get_feed_change` before approving, and each plan, approval, waiver, publish, and rollback writes an audit event. MISP is not read yet, and `mecfeed-serve` still does not serve snapshots. Scope history: [mecmcp#424](https://github.com/mechubsec/mecmcp/issues/424). Work is tracked in this repo's issues.
 
 ## License
 

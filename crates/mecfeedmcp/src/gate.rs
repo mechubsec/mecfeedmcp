@@ -460,7 +460,8 @@ impl FeedPublisher {
     /// # Errors
     ///
     /// Returns an error when the change set is unknown, belongs to another
-    /// feed, or no longer plans against the current feed.
+    /// feed, no longer admits, or would publish a different snapshot than the
+    /// one stored on the change set.
     pub async fn inspect(
         &self,
         change_set_id: &str,
@@ -476,10 +477,7 @@ impl FeedPublisher {
         };
         let action: FeedAction =
             serde_json::from_value(stored.clone()).map_err(|_| GateError::Admission)?;
-        let state = serde_json::to_value(record.state)
-            .ok()
-            .and_then(|value| value.as_str().map(str::to_string))
-            .unwrap_or_default();
+        let state = record.state.as_str().to_string();
         let (planned, current) = {
             let inner = self.lock()?;
             let planned =
@@ -492,22 +490,11 @@ impl FeedPublisher {
                 .unwrap_or_default();
             (planned, current)
         };
+        if planned.digest() != action_digest(&action) {
+            return Err(GateError::Digest);
+        }
         let document = planned.document();
-        let key = |row: &SnapshotRow| (kind_name(row.kind), row.value.clone());
-        let current_keys: std::collections::BTreeSet<_> = current.iter().map(key).collect();
-        let planned_keys: std::collections::BTreeSet<_> =
-            document.entries.iter().map(key).collect();
-        let added = document
-            .entries
-            .iter()
-            .filter(|row| !current_keys.contains(&key(row)))
-            .cloned()
-            .collect();
-        let removed = current
-            .iter()
-            .filter(|row| !planned_keys.contains(&key(row)))
-            .cloned()
-            .collect();
+        let (added, removed) = row_diff(&current, &document.entries);
         let (op, rollback_target) = match &action {
             FeedAction::Publish { .. } => ("publish", None),
             FeedAction::Rollback { target, .. } => ("rollback", Some(*target)),
@@ -673,6 +660,24 @@ fn action_digest(action: &FeedAction) -> &str {
             snapshot_digest, ..
         } => snapshot_digest,
     }
+}
+
+/// Rows present on only one side. Equality is the whole row, so a metadata
+/// change is both a removal and an addition.
+fn row_diff(
+    current: &[SnapshotRow],
+    planned: &[SnapshotRow],
+) -> (Vec<SnapshotRow>, Vec<SnapshotRow>) {
+    let mut removed = current.to_vec();
+    let mut added = Vec::new();
+    for row in planned {
+        if let Some(index) = removed.iter().position(|existing| existing == row) {
+            removed.remove(index);
+        } else {
+            added.push(row.clone());
+        }
+    }
+    (added, removed)
 }
 
 fn plan_action(
@@ -1203,5 +1208,42 @@ mod tests {
             .await
             .expect_err("unknown");
         assert_eq!(err, GateError::Conflict);
+    }
+
+    #[tokio::test]
+    async fn inspect_refuses_a_plan_whose_snapshot_changed() {
+        let fix = fixture();
+        let publisher = open(&fix, false);
+        let short = Proposal {
+            entries: vec![ProposedEntry {
+                kind: IndicatorKind::Ip,
+                value: "1.0.0.1".to_string(),
+                source: "lab".to_string(),
+                confidence: 50,
+                first_seen: NOW,
+                last_seen: NOW,
+                expires_at: Some(NOW + 100),
+                allow_broad_prefix: false,
+            }],
+        };
+        let first = publisher.plan("alice", short, NOW).await.expect("plan 1");
+        publisher
+            .approve("bob", true, &first.change_set_id, &first.digest)
+            .await
+            .expect("approve");
+        publisher
+            .apply("alice", &attr(), &first.change_set_id, &first.digest, NOW)
+            .await
+            .expect("apply");
+        let second = publisher
+            .plan("alice", one("1.0.0.2"), NOW)
+            .await
+            .expect("plan 2");
+        let err = publisher
+            .inspect(&second.change_set_id, NOW + 100)
+            .await
+            .expect_err("stale");
+        assert_eq!(err, GateError::Digest);
+        assert_eq!(publisher.history().expect("lock").len(), 1);
     }
 }

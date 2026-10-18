@@ -43,4 +43,5 @@ loopback-only allowlist rejects every client. Use host networking, or pass
 Match the rest of the mecmcp fleet: bearer tokens in
 `/var/lib/mecfeedmcp/tokens.json` mode `0600`, owned by `mecfeedmcp`. The
 binary generates `/var/lib/mecfeedmcp/audit-hmac.key` on first start if it
-is absent.
+is absent. Each plan, approval, waiver, publish, and rollback writes an
+audit event. The approver reads `get_feed_change` before `approve_feed_change`.
