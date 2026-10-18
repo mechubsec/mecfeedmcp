@@ -152,6 +152,8 @@ jq -e '
                 ["mecmcp-audit", "0.28.1"],
                 ["mecmcp-auth", "0.28.1"],
                 ["mecmcp-changeset", "0.28.1"],
+                ["mecmcp-http", "0.28.1"],
+                ["mecmcp-openapi", "0.28.1"],
                 ["mecmcp-redact", "0.28.1"],
                 ["mecmcp-runtime", "0.28.1"],
                 ["mecmcp-secret", "0.28.1"],
