@@ -269,7 +269,7 @@ pub struct RollbackFeedInput {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListIndicatorsInput {
-    /// `ip`, `cidr`, or `domain`. Absent returns all three.
+    /// `ip`, `cidr`, or `domain`. Applied after the fetch. Absent returns all three.
     #[serde(default)]
     pub kind: Option<String>,
     /// Maximum mapped rows. Absent uses the policy entry cap.
@@ -283,7 +283,7 @@ pub struct ListIndicatorsInput {
 pub struct SearchIndicatorsInput {
     /// Value match sent to MISP restSearch.
     pub query: String,
-    /// `ip`, `cidr`, or `domain`. Absent returns all three.
+    /// `ip`, `cidr`, or `domain`. Applied after the fetch. Absent returns all three.
     #[serde(default)]
     pub kind: Option<String>,
     /// Maximum mapped rows. Absent uses the policy entry cap.
@@ -348,7 +348,7 @@ impl FeedHandler {
     /// List mapped MISP indicators. Does not plan or publish.
     #[tool(
         name = "list_indicators",
-        description = "List mapped MISP indicators of ip, cidr, and domain kinds. Read-only. Does not plan or publish a snapshot"
+        description = "List mapped MISP indicators of ip, cidr, and domain kinds. Kind is applied after the fetch. truncated is true when the upstream page is full. Read-only. Does not plan or publish a snapshot"
     )]
     async fn list_indicators(
         &self,
@@ -377,7 +377,7 @@ impl FeedHandler {
     /// Search mapped MISP indicators by value. Does not plan or publish.
     #[tool(
         name = "search_indicators",
-        description = "Search mapped MISP indicators by value. Read-only. Does not plan or publish a snapshot"
+        description = "Search mapped MISP indicators by value. Kind is applied after the fetch. truncated is true when the upstream page is full. Read-only. Does not plan or publish a snapshot"
     )]
     async fn search_indicators(
         &self,
@@ -614,7 +614,7 @@ impl ServerHandler for FeedHandler {
             .with_server_info(Implementation::new("mecfeedmcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "mecfeedmcp publishes versioned threat-intel feed snapshots. \
-                 list_indicators and search_indicators read mapped MISP indicators; they do not plan or publish. \
+                 list_indicators and search_indicators read mapped MISP indicators; kind is applied after the fetch; they do not plan or publish. \
                  plan_feed_change admits a proposal and stores a digest. \
                  get_feed_change shows the approver the planned rows and the diff against the current snapshot; \
                  the approver reads it before approve_feed_change. \

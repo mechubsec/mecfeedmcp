@@ -651,7 +651,12 @@ fn is_suffix(domain: &str, suffix: &str) -> bool {
     }
 }
 
-fn normalize_domain(raw: &str) -> Result<String, EntryError> {
+/// Canonical DNS name: lowercase, no trailing dot, LDH labels, alphabetic TLD.
+///
+/// # Errors
+///
+/// Returns [`EntryError`] when the value is not a two-or-more-label DNS name.
+pub fn normalize_domain(raw: &str) -> Result<String, EntryError> {
     let value = raw.trim().trim_end_matches('.').to_ascii_lowercase();
     if value.is_empty() || value.len() > 253 || value.parse::<IpAddr>().is_ok() {
         return Err(unparseable_domain(raw));
