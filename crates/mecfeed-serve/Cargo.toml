@@ -15,6 +15,8 @@ axum-server.workspace = true
 clap.workspace = true
 http.workspace = true
 ipnet.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 rustls.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -23,6 +25,7 @@ mecfeedmcp-core = { version = "0.1.0", path = "../mecfeedmcp-core" }
 
 [dev-dependencies]
 rcgen = "0.14.10"
+tower = { version = "0.5.3", features = ["util"] }
 tempfile = "3.27.0"
 
 [lints]

@@ -15,3 +15,4 @@
 - The MCP server publishes a snapshot only after an approved change-set digest still matches. An unapproved digest is not written.
 - Feed change-control writes an audit event, and the actor type comes from the caller token. `get_feed_change` shows the canonical rows and the diff against the current snapshot, and refuses the preview when that snapshot no longer matches the stored plan.
 - `list_indicators` and `search_indicators` read mapped MISP attributes over HTTPS. The API key is a file or environment reference. Operator prefix and domain allowlists load from `feed.json`.
+- `mecfeed-serve` serves the current verified snapshot at `/feeds/{format}/{kind}` with ETag/If-None-Match and fails closed when the log does not verify.

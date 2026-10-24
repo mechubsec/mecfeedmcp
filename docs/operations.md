@@ -1,8 +1,8 @@
 # Operations
 
 > 🚧 **Under construction.** The MCP server publishes an approved snapshot
-> and can read MISP. `mecfeed-serve` does not serve snapshots yet. Do not
-> point production firewalls at it.
+> and can read MISP. `mecfeed-serve` serves verified snapshots; auth, abuse
+> limits, and the security review are not done. Do not deploy it.
 
 The shared `mecmcp` crates are pinned — to `v0.28.1`.
 
@@ -18,7 +18,7 @@ The shared `mecmcp` crates are pinned — to `v0.28.1`.
 | `/var/lib/mecfeedmcp/changeset-state.json` | change-set state |
 | `/var/lib/mecfeedmcp/snapshots` | snapshots written by the MCP server |
 | `/etc/mecfeed-serve/tls.crt`, `tls.key` | feed-server TLS material |
-| `/var/lib/mecfeed-serve/snapshots` | feed-server snapshot directory (not served yet) |
+| `/var/lib/mecfeed-serve/snapshots` | feed-server snapshot directory (served read-only at `/feeds/{format}/{kind}`) |
 
 The installer never enables either unit. Create config and credentials first,
 then `systemctl enable --now mecfeedmcp.service` (and `mecfeed-serve.service`
@@ -37,6 +37,12 @@ journald socket).
 Behind Docker NAT that address is the bridge gateway, so the default
 loopback-only allowlist rejects every client. Use host networking, or pass
 `--allow-cidr` with the firewall addresses that should pull snapshots.
+
+`mecfeed-serve` serves `GET`/`HEAD /feeds/{format}/{kind}` from the current
+verified snapshot and answers 503 when the snapshot log does not verify.
+Formats: `panos-edl`, `junos-dynamic-address`, `fortigate-threat-feed`,
+`opnsense-url-table`. Kinds: `address`, `prefix`, `domain` (Junos has no
+`domain`). Everything else is 404.
 
 ## Tokens and audit
 

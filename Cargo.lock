@@ -1361,8 +1361,11 @@ dependencies = [
  "mecfeedmcp-core",
  "rcgen",
  "rustls",
+ "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
