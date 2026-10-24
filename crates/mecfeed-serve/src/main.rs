@@ -21,7 +21,7 @@ use ipnet::IpNet;
 use mecfeedmcp_core::{FeedFormat, IndicatorKind, Limits, Policy, render_feed};
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-use serde::Deserialize;
+use serde::{Deserialize, de::IgnoredAny};
 use sha2::{Digest, Sha256};
 use snapshots::Loaded;
 use std::{
@@ -62,10 +62,24 @@ struct Args {
 }
 
 /// The slice of feed.json that serve needs. Unknown keys are ignored because
-/// the file also carries MCP-only settings. Mirrors
-/// `crates/mecfeedmcp/src/config.rs` `FeedConfig::policy`; both must change together.
-#[derive(Debug, Default, Deserialize)]
+/// the file also carries MCP-only settings, accepted but not read. The accepted
+/// key set mirrors `FeedConfig` in `crates/mecfeedmcp/src/config.rs` and
+/// `FeedConfig::policy`; both must change together.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // MCP-only keys are typed IgnoredAny and never read.
 struct FeedPolicyConfig {
+    version: u32,
+    #[serde(default)]
+    tenant: IgnoredAny,
+    #[serde(default)]
+    changeset_state_file: IgnoredAny,
+    #[serde(default)]
+    snapshot_dir: IgnoredAny,
+    #[serde(default)]
+    approval_ttl_secs: IgnoredAny,
+    #[serde(default)]
+    misp: IgnoredAny,
     #[serde(default)]
     own_prefixes: Vec<String>,
     #[serde(default)]
@@ -76,6 +90,9 @@ struct FeedPolicyConfig {
 
 impl FeedPolicyConfig {
     fn policy(&self) -> Result<Policy> {
+        if self.version != 1 {
+            anyhow::bail!("feed config version must be 1");
+        }
         let parse = |values: &[String]| -> Result<Vec<IpNet>> {
             values
                 .iter()
@@ -552,18 +569,56 @@ mod tests {
     }
 
     #[test]
-    fn feed_config_ignores_unknown_keys_and_rejects_bad_cidr() {
-        let ok: FeedPolicyConfig = serde_json::from_str(
-            r#"{"version":1,"tenant":"t","misp":{"x":1},"own_prefixes":["10.0.0.0/8"],"allow_domain_suffixes":["example.org"]}"#,
-        )
-        .expect("parses");
+    fn feed_config_accepts_mcp_keys_and_rejects_bad_input() {
+        let example = include_str!("../../../examples/feed.example.json");
+        let ok: FeedPolicyConfig = serde_json::from_str(example).expect("example parses");
         ok.policy().expect("policy");
-        let bad: FeedPolicyConfig =
-            serde_json::from_str(r#"{"allow_cidrs":["not-a-cidr"]}"#).expect("parses");
+        let with_misp = example.replacen(
+            "\"tenant\"",
+            "\"misp\": {\"base_url\": \"https://misp.example.org\"}, \"tenant\"",
+            1,
+        );
+        serde_json::from_str::<FeedPolicyConfig>(&with_misp).expect("misp parses");
+        let parse = |text: &str| serde_json::from_str::<FeedPolicyConfig>(text);
+        assert!(parse(r#"{"version":1,"tenant":"lab","allow_cirds":["1.0.0.0/24"]}"#).is_err());
+        assert!(parse(r#"{"tenant":"lab"}"#).is_err());
+        assert!(parse(r#"{"version":2}"#).expect("parses").policy().is_err());
+        let bad = parse(r#"{"version":1,"allow_cidrs":["not-a-cidr"]}"#).expect("parses");
         assert!(bad.policy().is_err());
-        let bad_suffix: FeedPolicyConfig =
-            serde_json::from_str(r#"{"allow_domain_suffixes":["x"]}"#).expect("parses");
+        let bad_suffix = parse(r#"{"version":1,"allow_domain_suffixes":["x"]}"#).expect("parses");
         assert!(bad_suffix.policy().is_err());
+    }
+
+    #[tokio::test]
+    async fn allowlist_entry_matching_only_history_does_not_block_a_clean_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old = now() - 10 * DAY;
+        let at = now();
+        let mut versions = feed_versions();
+        publish(
+            &mut versions,
+            old,
+            vec![entry(IndicatorKind::Ip, "1.0.0.1", old, old + DAY)],
+        );
+        publish(
+            &mut versions,
+            at,
+            vec![entry(IndicatorKind::Ip, "1.0.0.2", at, at + DAY)],
+        );
+        let second = versions.document(2).expect("v2");
+        assert!(second.entries.iter().all(|row| row.value != "1.0.0.1"));
+        write_layout(dir.path(), &versions, 2, 2);
+        let policy = Policy::try_new(
+            vec![],
+            vec!["1.0.0.1/32".parse().expect("cidr")],
+            Vec::<&str>::new(),
+            Limits::default(),
+        )
+        .expect("policy");
+        let app = app_with_policy(dir.path(), [127, 0, 0, 1], policy);
+        let (status, _, body) = send(&app, Method::GET, "/feeds/panos-edl/address", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"1.0.0.2\n");
     }
 
     #[tokio::test]
