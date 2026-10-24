@@ -61,9 +61,9 @@ struct Args {
     allow_cidr: Vec<IpNet>,
 }
 
-/// The slice of feed.json that serve needs. Unknown keys are ignored because
-/// the file also carries MCP-only settings, accepted but not read. The accepted
-/// key set mirrors `FeedConfig` in `crates/mecfeedmcp/src/config.rs` and
+/// The slice of feed.json that serve needs. MCP-only keys are accepted but not
+/// read; any other key is rejected so a typo cannot drop an allowlist. The
+/// accepted key set mirrors `FeedConfig` in `crates/mecfeedmcp/src/config.rs` and
 /// `FeedConfig::policy`; both must change together.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

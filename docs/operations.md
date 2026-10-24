@@ -45,10 +45,11 @@ Formats: `panos-edl`, `junos-dynamic-address`, `fortigate-threat-feed`,
 `domain`). Everything else is 404.
 
 `mecfeed-serve` requires `--feed-config` (the MCP server's `feed.json`). It reads
-the operator allowlists at startup and re-applies them to the current snapshot on every render (older versions are verified without them), so
-restart it after editing `feed.json`. An allowlist entry that conflicts with a
-published version makes it answer 503 until a new version is published without
-that entry. The packaged layout does not yet share the snapshot directory or
+the operator allowlists at startup and applies them to the current snapshot on
+every render, so restart it after editing `feed.json`. Older versions are
+verified without them. An allowlist entry that conflicts with the current
+version makes it answer 503 until a new version is published without that
+entry. The packaged layout does not yet share the snapshot directory or
 grant serve read access to `feed.json`; that wiring is a later change.
 
 ## Tokens and audit
