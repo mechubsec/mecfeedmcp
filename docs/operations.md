@@ -44,6 +44,13 @@ Formats: `panos-edl`, `junos-dynamic-address`, `fortigate-threat-feed`,
 `opnsense-url-table`. Kinds: `address`, `prefix`, `domain` (Junos has no
 `domain`). Everything else is 404.
 
+`mecfeed-serve` requires `--feed-config` (the MCP server's `feed.json`). It reads
+the operator allowlists at startup and re-applies them on every render, so
+restart it after editing `feed.json`. An allowlist entry that conflicts with a
+published version makes it answer 503 until a new version is published without
+that entry. The packaged layout does not yet share the snapshot directory or
+grant serve read access to `feed.json`; that wiring is a later change.
+
 ## Tokens and audit
 
 Match the rest of the mecmcp fleet: bearer tokens in

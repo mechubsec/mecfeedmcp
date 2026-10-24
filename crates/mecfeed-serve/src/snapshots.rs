@@ -9,10 +9,10 @@
 //! ```
 
 use anyhow::{Context, Result, bail};
-use mecfeedmcp_core::{FeedVersions, Limits, Policy, SnapshotDocument};
+use mecfeedmcp_core::{FeedVersions, Policy, SnapshotDocument};
 use std::{
     fs::{self, File},
-    io::Read,
+    io::{ErrorKind, Read},
     path::Path,
 };
 
@@ -22,6 +22,16 @@ pub struct Loaded {
     pub current: Option<u64>,
     /// The verified log.
     pub versions: FeedVersions,
+}
+
+/// Whether `path` exists as itself. Only `NotFound` means absent; any other
+/// error (for example permission denied) propagates so the caller fails closed.
+fn exists_no_follow(path: &Path) -> Result<bool> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("inspecting snapshot path"),
+    }
 }
 
 fn is_symlink(path: &Path) -> bool {
@@ -36,7 +46,7 @@ fn is_symlink(path: &Path) -> bool {
 /// Returns an error when the pointer is a symlink or is not a positive integer.
 pub fn current_number(dir: &Path) -> Result<Option<u64>> {
     let path = dir.join("current");
-    if path.symlink_metadata().is_err() {
+    if !exists_no_follow(&path)? {
         return Ok(None);
     }
     if is_symlink(&path) {
@@ -52,7 +62,7 @@ pub fn current_number(dir: &Path) -> Result<Option<u64>> {
 
 fn version_numbers(dir: &Path) -> Result<Vec<u64>> {
     let versions = dir.join("versions");
-    if versions.symlink_metadata().is_err() {
+    if !exists_no_follow(&versions)? {
         return Ok(Vec::new());
     }
     if is_symlink(&versions) || !versions.is_dir() {
@@ -91,7 +101,7 @@ fn read_snapshot(version_dir: &Path) -> Result<SnapshotDocument> {
     serde_json::from_slice(&bytes).context("parsing snapshot.json")
 }
 
-/// Load and verify every snapshot under `dir`.
+/// Load and verify every snapshot under `dir` against the operator `policy`.
 ///
 /// Every document is imported in order, so the digest chain and every row are
 /// checked by core. Any failure means the set does not verify.
@@ -99,7 +109,7 @@ fn read_snapshot(version_dir: &Path) -> Result<SnapshotDocument> {
 /// # Errors
 ///
 /// Returns an error when the layout, the `current` pointer, or the log is not acceptable.
-pub fn load(dir: &Path) -> Result<Loaded> {
+pub fn load(dir: &Path, policy: Policy) -> Result<Loaded> {
     let numbers = version_numbers(dir)?;
     if !numbers
         .iter()
@@ -109,10 +119,6 @@ pub fn load(dir: &Path) -> Result<Loaded> {
         bail!("version numbers are not contiguous from 1");
     }
     let current = current_number(dir)?;
-    // Serve does not read feed.json: operator allowlists were enforced at
-    // admission. Limits match the MCP server's `Config::policy`.
-    let policy = Policy::try_new(vec![], vec![], Vec::<&str>::new(), Limits::default())
-        .context("building verification policy")?;
     let mut versions = FeedVersions::open(policy);
     for number in &numbers {
         let document = read_snapshot(&dir.join("versions").join(number.to_string()))?;

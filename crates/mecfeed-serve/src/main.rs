@@ -10,16 +10,18 @@ use anyhow::{Context, Result};
 use axum::{
     Router,
     body::Body,
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::any,
 };
 use clap::Parser;
 use ipnet::IpNet;
-use mecfeedmcp_core::{FeedFormat, IndicatorKind, render_feed};
+use mecfeedmcp_core::{FeedFormat, IndicatorKind, Limits, Policy, render_feed};
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use snapshots::Loaded;
 use std::{
@@ -45,6 +47,11 @@ struct Args {
     #[arg(long)]
     tls_key: PathBuf,
 
+    /// Operator feed.json. Its prefix and domain allowlists are re-applied to
+    /// every published version before it is verified and before each render.
+    #[arg(long)]
+    feed_config: PathBuf,
+
     /// Directory of signed, versioned snapshots. May be empty.
     #[arg(long)]
     snapshot_dir: PathBuf,
@@ -54,10 +61,56 @@ struct Args {
     allow_cidr: Vec<IpNet>,
 }
 
+/// The slice of feed.json that serve needs. Unknown keys are ignored because
+/// the file also carries MCP-only settings. Mirrors
+/// `crates/mecfeedmcp/src/config.rs` `FeedConfig::policy`; both must change together.
+#[derive(Debug, Default, Deserialize)]
+struct FeedPolicyConfig {
+    #[serde(default)]
+    own_prefixes: Vec<String>,
+    #[serde(default)]
+    allow_cidrs: Vec<String>,
+    #[serde(default)]
+    allow_domain_suffixes: Vec<String>,
+}
+
+impl FeedPolicyConfig {
+    fn policy(&self) -> Result<Policy> {
+        let parse = |values: &[String]| -> Result<Vec<IpNet>> {
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("feed config has an unparsable CIDR"))
+                })
+                .collect()
+        };
+        Policy::try_new(
+            parse(&self.own_prefixes)?,
+            parse(&self.allow_cidrs)?,
+            self.allow_domain_suffixes.iter().map(String::as_str),
+            Limits::default(),
+        )
+        .context("feed config policy is not acceptable")
+    }
+}
+
+fn load_policy(path: &std::path::Path) -> Result<Policy> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("reading feed config {}", path.display()))?;
+    let config: FeedPolicyConfig = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing feed config {}", path.display()))?;
+    config.policy()
+}
+
 #[derive(Clone)]
 struct App {
     snapshot_dir: PathBuf,
     allow: Vec<IpNet>,
+    policy: Policy,
+    /// Serializes reloads so an older load can never overwrite a newer one.
+    reload: Arc<tokio::sync::Mutex<()>>,
     /// Last fully verified load. Readers only ever see a complete, verified set.
     cache: Arc<RwLock<Option<Arc<Loaded>>>>,
 }
@@ -85,6 +138,7 @@ async fn main() -> Result<()> {
         .install_default()
         .map_err(|_| anyhow::anyhow!("failed to install the rustls ring crypto provider"))?;
 
+    let policy = load_policy(&args.feed_config)?;
     let tls = load_tls(&args.tls_cert, &args.tls_key, Arc::new(provider))?;
     let allow = if args.allow_cidr.is_empty() {
         vec![
@@ -102,6 +156,8 @@ async fn main() -> Result<()> {
     let app = App {
         snapshot_dir: args.snapshot_dir,
         allow,
+        policy,
+        reload: Arc::default(),
         cache: Arc::default(),
     };
     let router = router(app);
@@ -146,18 +202,24 @@ fn client_allowed(allow: &[IpNet], addr: SocketAddr) -> bool {
     allow.iter().any(|net| net.contains(&ip))
 }
 
-async fn healthz(
-    method: Method,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
-    State(app): State<App>,
-) -> Response {
-    if !client_allowed(&app.allow, addr) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
+async fn healthz(method: Method) -> Response {
     match method {
         Method::GET | Method::HEAD => StatusCode::OK.into_response(),
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
+}
+
+/// Router-wide client allowlist: applies to every route, matched or not.
+async fn require_allowed_client(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(app): State<App>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !client_allowed(&app.allow, addr) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(request).await
 }
 
 fn router(app: App) -> Router {
@@ -165,7 +227,25 @@ fn router(app: App) -> Router {
         .route("/healthz", any(healthz))
         .route("/feeds/{format}/{kind}", any(feed))
         .fallback(|| async { StatusCode::NOT_FOUND })
+        .layer(middleware::from_fn_with_state(
+            app.clone(),
+            require_allowed_client,
+        ))
         .with_state(app)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .iter()
+        .flat_map(|byte| {
+            [
+                DIGITS[usize::from(byte >> 4)],
+                DIGITS[usize::from(byte & 15)],
+            ]
+        })
+        .map(char::from)
+        .collect()
 }
 
 fn parse_format(token: &str) -> Option<FeedFormat> {
@@ -206,8 +286,18 @@ async fn verified(app: &App) -> Result<Arc<Loaded>> {
     if let Some(loaded) = cached.filter(|loaded| loaded.current == current) {
         return Ok(loaded);
     }
+    let _reload = app.reload.lock().await;
+    let cached = app
+        .cache
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    if let Some(loaded) = cached.filter(|loaded| loaded.current == current) {
+        return Ok(loaded);
+    }
+    let policy = app.policy.clone();
     let loaded = Arc::new(
-        tokio::task::spawn_blocking(move || snapshots::load(&dir))
+        tokio::task::spawn_blocking(move || snapshots::load(&dir, policy))
             .await
             .context("loading snapshots panicked")??,
     );
@@ -231,13 +321,9 @@ fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
 async fn feed(
     method: Method,
     headers: HeaderMap,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
     State(app): State<App>,
     Path((format_token, kind_token)): Path<(String, String)>,
 ) -> Response {
-    if !client_allowed(&app.allow, addr) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
     if !matches!(method, Method::GET | Method::HEAD) {
         return (
             StatusCode::METHOD_NOT_ALLOWED,
@@ -261,11 +347,14 @@ async fn feed(
     let Some(latest) = loaded.versions.latest() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let now = SystemTime::now()
+    let Some(now) = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
-        .unwrap_or(0);
+    else {
+        tracing::error!("system clock is before the epoch or out of range");
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     // render_feed rejects a document holding any expired entry and nothing
     // sweeps the log, so entries must expire on their own at serve time.
     let live: Vec<_> = latest
@@ -282,11 +371,7 @@ async fn feed(
         }
     };
     let digest = Sha256::digest(body.as_bytes());
-    let hex = digest.iter().fold(String::new(), |mut out, byte| {
-        out.push_str(&format!("{byte:02x}"));
-        out
-    });
-    let etag = format!("\"sha256-{hex}\"");
+    let etag = format!("\"sha256-{}\"", hex(&digest));
     let Ok(etag_value) = HeaderValue::from_str(&etag) else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -320,7 +405,7 @@ async fn feed(
 
 #[cfg(test)]
 mod tests {
-    use super::{App, client_allowed, router};
+    use super::{App, FeedPolicyConfig, client_allowed, hex, router};
     use axum::{
         body::{Body, to_bytes},
         extract::connect_info::MockConnectInfo,
@@ -408,9 +493,19 @@ mod tests {
     }
 
     fn app_for_peer(dir: &Path, peer: [u8; 4]) -> axum::Router {
+        app_with_policy(dir, peer, empty_policy())
+    }
+
+    fn empty_policy() -> Policy {
+        Policy::try_new(vec![], vec![], Vec::<&str>::new(), Limits::default()).expect("policy")
+    }
+
+    fn app_with_policy(dir: &Path, peer: [u8; 4], policy: Policy) -> axum::Router {
         router(App {
             snapshot_dir: dir.to_path_buf(),
             allow: vec!["127.0.0.0/8".parse().expect("loopback")],
+            policy,
+            reload: std::sync::Arc::default(),
             cache: std::sync::Arc::default(),
         })
         .layer(MockConnectInfo(SocketAddr::from((peer, 1))))
@@ -437,11 +532,71 @@ mod tests {
     }
 
     fn etag_of(body: &[u8]) -> String {
-        let hex: String = Sha256::digest(body)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        format!("\"sha256-{hex}\"")
+        format!("\"sha256-{}\"", hex(&Sha256::digest(body)))
+    }
+
+    #[tokio::test]
+    async fn operator_allowlisted_value_in_a_published_version_fails_closed() {
+        let dir = one_version_dir();
+        let policy = Policy::try_new(
+            vec![],
+            vec!["1.0.0.0/24".parse().expect("cidr")],
+            Vec::<&str>::new(),
+            Limits::default(),
+        )
+        .expect("policy");
+        let app = app_with_policy(dir.path(), [127, 0, 0, 1], policy);
+        let (status, _, body) = send(&app, Method::GET, "/feeds/panos-edl/address", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn feed_config_ignores_unknown_keys_and_rejects_bad_cidr() {
+        let ok: FeedPolicyConfig = serde_json::from_str(
+            r#"{"version":1,"tenant":"t","misp":{"x":1},"own_prefixes":["10.0.0.0/8"],"allow_domain_suffixes":["example.org"]}"#,
+        )
+        .expect("parses");
+        ok.policy().expect("policy");
+        let bad: FeedPolicyConfig =
+            serde_json::from_str(r#"{"allow_cidrs":["not-a-cidr"]}"#).expect("parses");
+        assert!(bad.policy().is_err());
+        let bad_suffix: FeedPolicyConfig =
+            serde_json::from_str(r#"{"allow_domain_suffixes":["x"]}"#).expect("parses");
+        assert!(bad_suffix.policy().is_err());
+    }
+
+    #[tokio::test]
+    async fn allowlist_covers_unmatched_routes() {
+        let dir = one_version_dir();
+        let outsider = app_for_peer(dir.path(), [8, 8, 8, 8]);
+        let (status, _, _) = send(&outsider, Method::GET, "/nope", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _, _) = send(&outsider, Method::GET, "/healthz", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _, _) = send(&app(dir.path()), Method::GET, "/nope", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn unreadable_snapshot_dir_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = one_version_dir();
+        let mode = std::fs::metadata(dir.path()).expect("meta").permissions();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+        let readable = std::fs::read_dir(dir.path()).is_ok();
+        let (status, _, _) = send(
+            &app(dir.path()),
+            Method::GET,
+            "/feeds/panos-edl/address",
+            None,
+        )
+        .await;
+        std::fs::set_permissions(dir.path(), mode).expect("restore");
+        if !readable {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        }
     }
 
     #[tokio::test]

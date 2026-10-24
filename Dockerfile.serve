@@ -40,5 +40,6 @@ LABEL org.opencontainers.image.licenses="MIT"
 ENTRYPOINT ["/usr/local/bin/mecfeed-serve", \
     "--tls-cert", "/etc/mecfeed-serve/tls.crt", \
     "--tls-key", "/etc/mecfeed-serve/tls.key", \
-    "--snapshot-dir", "/var/lib/mecfeed-serve/snapshots"]
+    "--snapshot-dir", "/var/lib/mecfeed-serve/snapshots", \
+    "--feed-config", "/etc/mecfeedmcp/feed.json"]
 CMD ["--listen", "0.0.0.0:8443"]
