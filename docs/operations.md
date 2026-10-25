@@ -86,22 +86,42 @@ there. To print the public key again:
 runuser -u mecfeedmcp -- mecfeedmcp --snapshot-signing-key-file /var/lib/mecfeedmcp/snapshot-signing.key --print-snapshot-signing-public-key
 ```
 
-Docker: create the key once, keep the public half, and mount that file into the
-serve container at `/etc/mecfeed-serve/snapshot-signing.pub`:
+Docker: create the key once, keep the public half, make it readable by the
+serve container (uid 65532), and mount it there read-only at
+`/etc/mecfeed-serve/snapshot-signing.pub`:
 
 ```sh
 docker run --rm -v <state_dir>:/var/lib/mecfeedmcp --user 65532:65532 <image> --init-snapshot-signing-key > snapshot-signing.pub
+chmod 0644 snapshot-signing.pub
 ```
 
-Rotation:
+```sh
+-v "$PWD/snapshot-signing.pub:/etc/mecfeed-serve/snapshot-signing.pub:ro"
+```
 
-1. Create a new key at a new path.
-2. Add its `.pub` as a second `--trusted-snapshot-key` on serve and restart serve.
-3. Point the MCP unit at the new key and restart it.
+Rotation (systemd). Each step that changes a unit ends with
+`systemctl daemon-reload` and a restart; restart alone keeps the cached unit.
+Change flags in a drop-in (`systemctl edit mecfeedmcp`, `systemctl edit
+mecfeed-serve`) that sets an empty `ExecStart=` and then the full new
+`ExecStart=`.
+
+1. Create a new key at a new path; this prints the new public key, so save it
+   as the second `.pub`:
+   `runuser -u mecfeedmcp -- mecfeedmcp --snapshot-signing-key-file /var/lib/mecfeedmcp/<new-name>.key --init-snapshot-signing-key`
+2. Add that `.pub` as a second `--trusted-snapshot-key` on serve (drop-in),
+   then `systemctl daemon-reload` and restart serve.
+3. Point the MCP unit at the new key (drop-in), then `systemctl daemon-reload`
+   and restart it.
 4. Publish one version.
-5. Remove the old `--trusted-snapshot-key` and restart serve.
+5. Remove the old `--trusted-snapshot-key` (drop-in), then
+   `systemctl daemon-reload` and restart serve.
 
-Upgrading from an unsigned release:
+Re-running the installer resets the units to the default key path. Keep the
+rotated key's path in a drop-in, and do not replace the key at the default path
+while an old `.pub` sits at the default `.pub` path: the installer stops on a
+`.pub` that does not match the key.
+
+Upgrading from an unsigned release (systemd/LXC):
 
 1. `systemctl stop mecfeed-serve mecfeedmcp`
 2. Re-run the installer with `MECFEEDMCP_FORCE_UNIT=1` so both units get the new
@@ -109,9 +129,20 @@ Upgrading from an unsigned release:
 3. `systemctl start mecfeedmcp mecfeed-serve`
 4. Publish one new version (plan, approve, apply).
 
-Serve answers 503 between steps 3 and 4, because older versions have no
-signature. `rollback_feed` cannot be used for step 4, because it refuses the
-current version.
+Upgrading from an unsigned release (Docker). The serve image now requires the
+mounted `.pub`, so an existing serve container will not start without it:
+
+1. Stop both containers.
+2. Run the new mecfeedmcp image once with `--init-snapshot-signing-key` against
+   the existing state volume, writing `snapshot-signing.pub`, then
+   `chmod 0644` it (as above).
+3. Start mecfeedmcp from the new image.
+4. Start serve from the new image with the `.pub` mounted read-only.
+5. Publish one new version.
+
+Serve answers 503 until that publish (systemd steps 3 to 4, Docker steps 4 to
+5), because older versions have no signature. `rollback_feed` cannot be used to
+publish, because it refuses the current version.
 
 Serve verifies once per `current` change and serves from memory. A `.sig`
 changed after that is noticed at the next publish or serve restart.
