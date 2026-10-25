@@ -6,10 +6,14 @@
 //! ```text
 //! <dir>/current                     "N\n", N >= 1, no leading zero
 //! <dir>/versions/<N>/snapshot.json  serde_json of SnapshotDocument
+//! <dir>/versions/<N>/snapshot.sig   detached signature; only the current version's is read
 //! ```
 
 use anyhow::{Context, Result, bail};
-use mecfeedmcp_core::{FeedVersions, Limits, Policy, SnapshotDocument};
+use mecfeedmcp_core::{
+    FeedVersions, Limits, Policy, SIGNATURE_FILE_MAX_BYTES, SIGNATURE_FILE_NAME, SignatureFile,
+    SnapshotDocument, TrustedKeys, parse_signature_file,
+};
 use std::{
     fs::{self, File},
     io::{ErrorKind, Read},
@@ -101,6 +105,27 @@ fn read_snapshot(version_dir: &Path) -> Result<SnapshotDocument> {
     serde_json::from_slice(&bytes).context("parsing snapshot.json")
 }
 
+fn read_signature(version_dir: &Path) -> Result<SignatureFile> {
+    let path = version_dir.join(SIGNATURE_FILE_NAME);
+    if is_symlink(&path) {
+        bail!("snapshot.sig is a symlink");
+    }
+    let file = File::open(&path).context("opening snapshot.sig")?;
+    if !file
+        .metadata()
+        .context("inspecting snapshot.sig")?
+        .is_file()
+    {
+        bail!("snapshot.sig is not a regular file");
+    }
+    let mut bytes = Vec::new();
+    // One byte past the cap, so an oversized file fails the parse instead of being truncated into one that passes.
+    file.take(SIGNATURE_FILE_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("reading snapshot.sig")?;
+    parse_signature_file(&bytes).context("parsing snapshot.sig")
+}
+
 /// Load and verify every snapshot under `dir`, then apply the operator `policy`.
 ///
 /// Every document is imported in order, so the digest chain and every row are
@@ -108,8 +133,9 @@ fn read_snapshot(version_dir: &Path) -> Result<SnapshotDocument> {
 ///
 /// # Errors
 ///
-/// Returns an error when the layout, the `current` pointer, or the log is not acceptable.
-pub fn load(dir: &Path, policy: Policy) -> Result<Loaded> {
+/// Returns an error when the layout, the `current` pointer, or the log is not acceptable,
+/// or the current version's signature does not verify.
+pub fn load(dir: &Path, policy: Policy, trusted: &TrustedKeys) -> Result<Loaded> {
     let numbers = version_numbers(dir)?;
     if !numbers
         .iter()
@@ -130,17 +156,25 @@ pub fn load(dir: &Path, policy: Policy) -> Result<Loaded> {
     let baseline = Policy::try_new(vec![], vec![], Vec::<&str>::new(), limits)
         .context("building baseline policy")?;
     let mut versions = FeedVersions::open(baseline);
+    let mut latest_digest: Option<String> = None;
     for number in &numbers {
         let document = read_snapshot(&dir.join("versions").join(number.to_string()))?;
         if document.number != *number {
             bail!("document number does not match its directory");
         }
+        latest_digest = Some(document.digest.clone());
         versions
             .import_document(document, 0)
             .with_context(|| format!("version {number} does not verify"))?;
     }
     if current != numbers.last().copied() {
         bail!("current does not name the latest version");
+    }
+    if let (Some(number), Some(digest)) = (current, latest_digest.as_deref()) {
+        let signature = read_signature(&dir.join("versions").join(number.to_string()))?;
+        trusted
+            .verify(digest, &signature)
+            .with_context(|| format!("version {number} signature does not verify"))?;
     }
     versions.update_policy(policy);
     Ok(Loaded { current, versions })
