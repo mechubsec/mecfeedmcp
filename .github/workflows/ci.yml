@@ -59,6 +59,7 @@ jobs:
           echo "$argv" | grep -q -- '/etc/mecfeedmcp/feed.json' || { echo "FAIL: --device-mapping path missing from argv with --host override"; exit 1; }
           echo "$argv" | grep -q -- '/var/lib/mecfeedmcp/tokens.json' || { echo "FAIL: --tokens-file path missing from argv with --host override"; exit 1; }
           echo "$argv" | grep -q -- '/var/lib/mecfeedmcp/audit-hmac.key' || { echo "FAIL: --audit-hmac-key-file path missing from argv with --host override"; exit 1; }
+          echo "$argv" | grep -q -- '/var/lib/mecfeedmcp/snapshot-signing.key' || { echo "FAIL: --snapshot-signing-key-file path missing from argv with --host override"; exit 1; }
           echo "PASS: config paths survive --host override"
       - name: Verify feed-server TLS paths survive --listen override
         run: |
@@ -68,6 +69,7 @@ jobs:
           echo "$argv" | grep -q -- '/etc/mecfeed-serve/tls.crt' || { echo "FAIL: --tls-cert missing from argv"; exit 1; }
           echo "$argv" | grep -q -- '/etc/mecfeed-serve/tls.key' || { echo "FAIL: --tls-key missing from argv"; exit 1; }
           echo "$argv" | grep -q -- '/var/lib/mecfeed-snapshots' || { echo "FAIL: --snapshot-dir missing from argv"; exit 1; }
+          echo "$argv" | grep -q -- '/etc/mecfeed-serve/snapshot-signing.pub' || { echo "FAIL: --trusted-snapshot-key missing from argv"; exit 1; }
           echo "PASS: feed-server TLS paths survive --listen override"
       - name: Verify the audit HMAC key is generated on first run
         run: |
@@ -90,6 +92,20 @@ jobs:
             mecfeedmcp:ci --transport stdio --allow-no-auth || true
           sudo test -s "$state_dir/audit-hmac.key" || { echo "FAIL: audit-hmac.key was not generated"; exit 1; }
           echo "PASS: audit-hmac.key generated on first run"
+      - name: Verify the snapshot signing key can be created and printed
+        run: |
+          state_dir=$(mktemp -d)
+          chmod 0700 "$state_dir"
+          sudo chown 65532:65532 "$state_dir"
+          docker run --rm -v "$state_dir:/var/lib/mecfeedmcp" --user 65532:65532 \
+            mecfeedmcp:ci --init-snapshot-signing-key > init.out
+          docker run --rm -v "$state_dir:/var/lib/mecfeedmcp" --user 65532:65532 \
+            mecfeedmcp:ci --print-snapshot-signing-public-key > print.out
+          cmp init.out print.out || { echo "FAIL: init and print disagree"; exit 1; }
+          [ "$(sudo stat -c %a "$state_dir/snapshot-signing.key")" = 600 ] || { echo "FAIL: key mode is not 0600"; exit 1; }
+          if docker run --rm -v "$state_dir:/var/lib/mecfeedmcp" --user 65532:65532 \
+            mecfeedmcp:ci --init-snapshot-signing-key; then echo "FAIL: init overwrote a key"; exit 1; fi
+          echo "PASS: snapshot signing key created once and printed"
 
   packaging:
     name: Package

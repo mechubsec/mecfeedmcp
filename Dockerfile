@@ -42,7 +42,8 @@ LABEL io.modelcontextprotocol.server.name="io.github.mechubsec/mecfeedmcp"
 ENTRYPOINT ["/usr/local/bin/mecfeedmcp", \
     "--device-mapping", "/etc/mecfeedmcp/feed.json", \
     "--tokens-file", "/var/lib/mecfeedmcp/tokens.json", \
-    "--audit-hmac-key-file", "/var/lib/mecfeedmcp/audit-hmac.key"]
+    "--audit-hmac-key-file", "/var/lib/mecfeedmcp/audit-hmac.key", \
+    "--snapshot-signing-key-file", "/var/lib/mecfeedmcp/snapshot-signing.key"]
 CMD ["--transport", "streamable-http", \
     "--host", "127.0.0.1", \
     "--port", "30040"]

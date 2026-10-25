@@ -16,8 +16,10 @@ The shared `mecmcp` crates are pinned — to `v0.28.1`.
 | `/var/lib/mecfeedmcp/tokens.json` | bearer-token store |
 | `/var/lib/mecfeedmcp/audit-hmac.key` | audit HMAC key (generated on first run) |
 | `/var/lib/mecfeedmcp/changeset-state.json` | change-set state |
+| `/var/lib/mecfeedmcp/snapshot-signing.key` | snapshot signing key (`0600 mecfeedmcp`, never leaves the host) |
 | `/var/lib/mecfeed-snapshots` | snapshots: written by the MCP server, read by mecfeed-serve (mecfeedmcp:mecfeed-serve, setgid 2750) |
 | `/etc/mecfeed-serve/tls.crt`, `tls.key` | feed-server TLS material |
+| `/etc/mecfeed-serve/snapshot-signing.pub` | trusted snapshot public key (`0644 root`) |
 
 The installer never enables either unit. Create config and credentials first,
 then `systemctl enable --now mecfeedmcp.service` (and `mecfeed-serve.service`
@@ -28,7 +30,7 @@ once TLS files exist).
 Images: `ghcr.io/mechubsec/mecfeedmcp` and `ghcr.io/mechubsec/mecfeedmcp/mecfeed-serve`
 (and the matching `docker.io/mechub/...` names). Both run as uid **65532**.
 The MCP image's `ENTRYPOINT` keeps `--device-mapping`, `--tokens-file`, and
-`--audit-hmac-key-file` so an operator `--host` override cannot drop them.
+`--audit-hmac-key-file`, and `--snapshot-signing-key-file` so an operator `--host` override cannot drop them.
 `--audit-format json` is the correct audit sink in a container (there is no
 journald socket).
 Mount one host directory at `/var/lib/mecfeed-snapshots` in both containers: writable by uid 65532 for the MCP server, `:ro` for `mecfeed-serve`.
@@ -67,6 +69,52 @@ find /var/lib/mecfeed-snapshots -type f -exec chmod 0640 {} +
 
 Then set `snapshot_dir` to `/var/lib/mecfeed-snapshots` in `feed.json` and start both
 services.
+
+## Snapshot signing
+
+Each published version gets `versions/<N>/snapshot.sig`. `mecfeed-serve` serves
+only a current version whose signature verifies against a
+`--trusted-snapshot-key`; there is no unsigned mode.
+
+Files: `/var/lib/mecfeedmcp/snapshot-signing.key` (`0600 mecfeedmcp`, never
+leaves the host) and `/etc/mecfeed-serve/snapshot-signing.pub` (`0644 root`).
+The installer creates both, and its next step 5 prints the public key. To serve
+from another host, copy the `.pub` to `/etc/mecfeed-serve/snapshot-signing.pub`
+there. To print the public key again:
+
+```sh
+runuser -u mecfeedmcp -- mecfeedmcp --snapshot-signing-key-file /var/lib/mecfeedmcp/snapshot-signing.key --print-snapshot-signing-public-key
+```
+
+Docker: create the key once, keep the public half, and mount that file into the
+serve container at `/etc/mecfeed-serve/snapshot-signing.pub`:
+
+```sh
+docker run --rm -v <state_dir>:/var/lib/mecfeedmcp --user 65532:65532 <image> --init-snapshot-signing-key > snapshot-signing.pub
+```
+
+Rotation:
+
+1. Create a new key at a new path.
+2. Add its `.pub` as a second `--trusted-snapshot-key` on serve and restart serve.
+3. Point the MCP unit at the new key and restart it.
+4. Publish one version.
+5. Remove the old `--trusted-snapshot-key` and restart serve.
+
+Upgrading from an unsigned release:
+
+1. `systemctl stop mecfeed-serve mecfeedmcp`
+2. Re-run the installer with `MECFEEDMCP_FORCE_UNIT=1` so both units get the new
+   flags. This also creates the key and the `.pub`.
+3. `systemctl start mecfeedmcp mecfeed-serve`
+4. Publish one new version (plan, approve, apply).
+
+Serve answers 503 between steps 3 and 4, because older versions have no
+signature. `rollback_feed` cannot be used for step 4, because it refuses the
+current version.
+
+Serve verifies once per `current` change and serves from memory. A `.sig`
+changed after that is noticed at the next publish or serve restart.
 
 ## Tokens and audit
 

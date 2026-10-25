@@ -18,3 +18,4 @@
 - `mecfeed-serve` serves the current verified snapshot at `/feeds/{format}/{kind}` with ETag/If-None-Match and fails closed when the log does not verify.
 - The packaged MCP server and mecfeed-serve share /var/lib/mecfeed-snapshots; serve reads feed.json through systemd LoadCredential.
 - The MCP server verifies stored history without the operator allowlists, so a new allowlist entry that matches an old version no longer stops it starting.
+- **Breaking:** published snapshots are signed with Ed25519 and mecfeed-serve serves only a current snapshot whose signature verifies. New required flags: `--snapshot-signing-key-file` (mecfeedmcp, to publish) and `--trusted-snapshot-key` (mecfeed-serve). The installer creates the key; after upgrading, serve returns 503 until one new version is published. See docs/operations.md, "Snapshot signing".
