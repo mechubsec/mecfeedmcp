@@ -52,11 +52,12 @@ version makes it answer 503 until a new version is published without that
 entry. The packaged serve unit reads `feed.json` through
 `LoadCredential`, so the file stays `0640 root:mecfeedmcp`; the MCP unit runs with
 `UMask=0027` so new snapshots are group-readable by `mecfeed-serve`. Installs from
-before this change kept snapshots in `/var/lib/mecfeedmcp/snapshots`; move them to
-`/var/lib/mecfeed-snapshots`, set owner `mecfeedmcp:mecfeed-serve` with dirs `2750`
-and files `0640`, and set `snapshot_dir` in `feed.json`. Both unit files changed, so re-run the
-installer with `MECFEEDMCP_FORCE_UNIT=1` (it otherwise keeps a changed unit as customized), then
-restart both services.
+before this change kept snapshots in `/var/lib/mecfeedmcp/snapshots`. To upgrade, stop
+both services first so no publish lands in the old tree. Re-run the installer with
+`MECFEEDMCP_FORCE_UNIT=1`: both unit files changed, and it otherwise keeps a changed
+unit as customized. Move the snapshots to `/var/lib/mecfeed-snapshots`, set owner
+`mecfeedmcp:mecfeed-serve` with dirs `2750` and files `0640`, set `snapshot_dir` in
+`feed.json`, then start both services.
 
 ## Tokens and audit
 
