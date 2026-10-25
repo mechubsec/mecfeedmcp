@@ -258,7 +258,9 @@ mkdir -p "$mcp_dropin_dir" "$serve_dropin_dir"
 printf '%s\n' '[Service]' 'ExecStart=' "ExecStart = /usr/local/bin/mecfeedmcp \\" \
     '# a comment inside a continuation is skipped' \
     '    --snapshot-signing-key-file /var/lib/mecfeedmcp/snapshot-signing.key' >"$mcp_dropin_dir/10-signing.conf"
+# systemd ignores an ExecStart outside [Service], so the misplaced flag must not count.
 printf '%s\n' '[Service]' 'ExecStart=' 'ExecStart=/usr/local/bin/mecfeed-serve --listen 0.0.0.0:8443' \
+    '[Unit]' 'ExecStart=/usr/local/bin/mecfeed-serve --trusted-snapshot-key /etc/mecfeed-serve/x.pub' \
     >"$serve_dropin_dir/10-stale.conf"
 stage_install >/dev/null 2>"$work_dir/dropin.err"
 if grep -Fq -- 'lacks --snapshot-signing-key-file' "$work_dir/dropin.err"; then

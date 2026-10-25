@@ -426,14 +426,17 @@ mv -fT -- "$signing_pub_tmp" "$signing_pub_path"
 # `systemctl show -P ExecStart` instead if those ever matter.
 warn_if_exec_start_lacks() {
     local unit=$1 flag=$2 dropins
+    # systemd sorts drop-ins bytewise, not by the caller's locale.
+    local LC_ALL=C
     shopt -s nullglob
     dropins=("$unit.d"/*.conf)
     shopt -u nullglob
     awk '
-        FNR == 1 { joined = "" }
+        FNR == 1 { joined = ""; in_service = 0 }
         /^[[:space:]]*[#;]/ { next }
-        /\\$/ { joined = joined substr($0, 1, length($0) - 1); next }
-        { joined = joined $0; if (joined ~ /^[[:space:]]*ExecStart[[:space:]]*=/) last = joined; joined = "" }
+        joined == "" && /^[[:space:]]*\[/ { in_service = ($0 ~ /^[[:space:]]*\[Service\][[:space:]]*$/); next }
+        /\\$/ { joined = joined substr($0, 1, length($0) - 1) " "; next }
+        { joined = joined $0; if (in_service && joined ~ /^[[:space:]]*ExecStart[[:space:]]*=/) last = joined; joined = "" }
         END { print last }
     ' "$unit" "${dropins[@]}" | grep -Fq -- "$flag" \
         || printf '%s\n' "warning: the ExecStart from $unit and its drop-ins lacks $flag, so the service will not start; re-run with MECFEEDMCP_FORCE_UNIT=1 or fix the unit and its drop-ins" >&2
