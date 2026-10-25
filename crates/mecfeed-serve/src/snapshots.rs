@@ -17,6 +17,7 @@ use mecfeedmcp_core::{
 use std::{
     fs::{self, File},
     io::{ErrorKind, Read},
+    os::unix::fs::OpenOptionsExt,
     path::Path,
 };
 
@@ -43,20 +44,38 @@ fn is_symlink(path: &Path) -> bool {
         .is_ok_and(|meta| meta.file_type().is_symlink())
 }
 
+/// Open `path` read-only as a regular file. `O_NOFOLLOW` refuses a symlink and
+/// `O_NONBLOCK` keeps `open(2)` on a FIFO from blocking; the type check then rejects it.
+fn open_regular(path: &Path, name: &str) -> Result<File> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("opening {name}"))?;
+    if !file
+        .metadata()
+        .with_context(|| format!("inspecting {name}"))?
+        .is_file()
+    {
+        bail!("{name} is not a regular file");
+    }
+    Ok(file)
+}
+
 /// Read the `current` pointer. `None` when the file does not exist.
 ///
 /// # Errors
 ///
-/// Returns an error when the pointer is a symlink or is not a positive integer.
+/// Returns an error when the pointer is not a regular file or is not a positive integer.
 pub fn current_number(dir: &Path) -> Result<Option<u64>> {
     let path = dir.join("current");
     if !exists_no_follow(&path)? {
         return Ok(None);
     }
-    if is_symlink(&path) {
-        bail!("current is a symlink");
-    }
-    let text = fs::read_to_string(&path).context("reading current")?;
+    let mut text = String::new();
+    open_regular(&path, "current")?
+        .read_to_string(&mut text)
+        .context("reading current")?;
     let number: u64 = text.trim().parse().context("parsing current")?;
     if number == 0 {
         bail!("current is zero");
@@ -94,12 +113,8 @@ fn version_numbers(dir: &Path) -> Result<Vec<u64>> {
 
 fn read_snapshot(version_dir: &Path) -> Result<SnapshotDocument> {
     let path = version_dir.join("snapshot.json");
-    if is_symlink(&path) {
-        bail!("snapshot.json is a symlink");
-    }
     let mut bytes = Vec::new();
-    File::open(&path)
-        .context("opening snapshot.json")?
+    open_regular(&path, "snapshot.json")?
         .read_to_end(&mut bytes)
         .context("reading snapshot.json")?;
     serde_json::from_slice(&bytes).context("parsing snapshot.json")
@@ -107,17 +122,7 @@ fn read_snapshot(version_dir: &Path) -> Result<SnapshotDocument> {
 
 fn read_signature(version_dir: &Path) -> Result<SignatureFile> {
     let path = version_dir.join(SIGNATURE_FILE_NAME);
-    if is_symlink(&path) {
-        bail!("snapshot.sig is a symlink");
-    }
-    let file = File::open(&path).context("opening snapshot.sig")?;
-    if !file
-        .metadata()
-        .context("inspecting snapshot.sig")?
-        .is_file()
-    {
-        bail!("snapshot.sig is not a regular file");
-    }
+    let file = open_regular(&path, "snapshot.sig")?;
     let mut bytes = Vec::new();
     // One byte past the cap, so an oversized file fails the parse instead of being truncated into one that passes.
     file.take(SIGNATURE_FILE_MAX_BYTES as u64 + 1)
@@ -179,3 +184,7 @@ pub fn load(dir: &Path, policy: Policy, trusted: &TrustedKeys) -> Result<Loaded>
     versions.update_policy(policy);
     Ok(Loaded { current, versions })
 }
+
+#[cfg(test)]
+#[path = "snapshots_test.rs"]
+mod snapshots_test;

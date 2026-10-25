@@ -15,6 +15,7 @@ axum-server.workspace = true
 clap.workspace = true
 http.workspace = true
 ipnet.workspace = true
+libc.workspace = true
 mecfeedmcp-core = { version = "0.1.0", path = "../mecfeedmcp-core" }
 rustls.workspace = true
 serde.workspace = true

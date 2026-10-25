@@ -39,6 +39,7 @@ clap = { version = "4", features = ["derive"] }
 ed25519-dalek = "3"
 http = "1"
 ipnet = "2"
+libc = "0.2"
 rand = "0.10"
 rmcp = { version = ">=3.5.1,<4", features = ["server", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 rustix = { version = "1", features = ["process"] }
