@@ -1,6 +1,7 @@
 //! The snapshot signing key: creating it, its public half, and signing a digest.
 //! The signature format lives in `mecfeedmcp_core`.
 
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions, Permissions};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -52,14 +53,12 @@ pub fn init_key_file(path: &Path) -> Result<(String, String), SnapshotKeyError> 
     let Some(file_name) = path.file_name() else {
         return Err(write_error(ErrorKind::InvalidInput.into()));
     };
-    // A crash leaves at most a stray `.partial` file; the pid in its name keeps it from blocking a later init.
-    let mut temp_name = std::ffi::OsString::from(".");
-    temp_name.push(file_name);
-    temp_name.push(format!(".{}.partial", std::process::id()));
-    let temp_path = path.with_file_name(temp_name);
-
-    let staged = stage_key(&temp_path, &key);
-    let linked = staged.and_then(|()| std::fs::hard_link(&temp_path, path));
+    // A crash leaves at most a stray `.partial` file; it is never reused or deleted, so it cannot block a later init.
+    let (temp_path, mut temp_file) = create_staging_file(path, file_name).map_err(write_error)?;
+    // From here the staging file is ours: every exit path removes it.
+    let linked =
+        write_staged_key(&mut temp_file, &key).and_then(|()| std::fs::hard_link(&temp_path, path));
+    drop(temp_file);
     let _ = std::fs::remove_file(&temp_path);
     if let Err(error) = linked {
         return Err(match error.kind() {
@@ -72,13 +71,29 @@ pub fn init_key_file(path: &Path) -> Result<(String, String), SnapshotKeyError> 
     public_key_text(&key)
 }
 
-/// Write `key` to a new 0600 file at `temp_path` (umask-proof) and sync it.
-fn stage_key(temp_path: &Path, key: &SigningKey) -> std::io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(temp_path)?;
+/// Exclusively create a 0600 staging file next to `path`, skipping names already taken.
+fn create_staging_file(path: &Path, file_name: &OsStr) -> std::io::Result<(PathBuf, File)> {
+    for attempt in 0..64 {
+        let mut temp_name = OsString::from(".");
+        temp_name.push(file_name);
+        temp_name.push(format!(".{}.{attempt}.partial", std::process::id()));
+        let temp_path = path.with_file_name(temp_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(ErrorKind::AlreadyExists.into())
+}
+
+/// Write `key` to the staging `file` (0600 under any umask) and sync it.
+fn write_staged_key(file: &mut File, key: &SigningKey) -> std::io::Result<()> {
     file.set_permissions(Permissions::from_mode(0o600))?;
     file.write_all(audit_signing::encode_signing_key(key).as_bytes())?;
     file.sync_all()
@@ -168,7 +183,8 @@ mod tests {
     #[test]
     fn init_ignores_a_stale_partial_file_and_leaves_no_temp() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let stale = dir.path().join(".snapshot-signing.key.1.partial");
+        let stale_name = format!(".snapshot-signing.key.{}.0.partial", std::process::id());
+        let stale = dir.path().join(&stale_name);
         fs::write(&stale, b"junk").expect("stale");
         let path = dir.path().join("snapshot-signing.key");
         init_key_file(&path).expect("init");
@@ -178,10 +194,8 @@ mod tests {
             .map(|entry| entry.expect("entry").file_name())
             .collect();
         names.sort();
-        assert_eq!(
-            names,
-            [".snapshot-signing.key.1.partial", "snapshot-signing.key"]
-        );
+        assert_eq!(names, [stale_name.as_str(), "snapshot-signing.key"]);
+        assert_eq!(fs::read(&stale).expect("stale kept"), b"junk");
     }
 
     #[test]
