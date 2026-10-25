@@ -16,9 +16,8 @@ The shared `mecmcp` crates are pinned — to `v0.28.1`.
 | `/var/lib/mecfeedmcp/tokens.json` | bearer-token store |
 | `/var/lib/mecfeedmcp/audit-hmac.key` | audit HMAC key (generated on first run) |
 | `/var/lib/mecfeedmcp/changeset-state.json` | change-set state |
-| `/var/lib/mecfeedmcp/snapshots` | snapshots written by the MCP server |
+| `/var/lib/mecfeed-snapshots` | snapshots: written by the MCP server, read by mecfeed-serve (mecfeedmcp:mecfeed-serve, setgid 2750) |
 | `/etc/mecfeed-serve/tls.crt`, `tls.key` | feed-server TLS material |
-| `/var/lib/mecfeed-serve/snapshots` | feed-server snapshot directory (served read-only at `/feeds/{format}/{kind}`) |
 
 The installer never enables either unit. Create config and credentials first,
 then `systemctl enable --now mecfeedmcp.service` (and `mecfeed-serve.service`
@@ -49,8 +48,12 @@ the operator allowlists at startup and applies them to the current snapshot on
 every render, so restart it after editing `feed.json`. Older versions are
 verified without them. An allowlist entry that conflicts with the current
 version makes it answer 503 until a new version is published without that
-entry. The packaged layout does not yet share the snapshot directory or
-grant serve read access to `feed.json`; that wiring is a later change.
+entry. The packaged serve unit reads `feed.json` through
+`LoadCredential`, so the file stays `0640 root:mecfeedmcp`; the MCP unit runs with
+`UMask=0027` so new snapshots are group-readable by `mecfeed-serve`. Installs from
+before this change kept snapshots in `/var/lib/mecfeedmcp/snapshots`; move them to
+`/var/lib/mecfeed-snapshots`, set owner `mecfeedmcp:mecfeed-serve` with dirs `2750`
+and files `0640`, and set `snapshot_dir` in `feed.json`.
 
 ## Tokens and audit
 

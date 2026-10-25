@@ -218,8 +218,8 @@ fn validate_config_file(package_dir: &Path) -> Result<()> {
             "config example changeset_state_file must be '/var/lib/mecfeedmcp/changeset-state.json'"
         );
     }
-    if config.snapshot_dir != Path::new("/var/lib/mecfeedmcp/snapshots") {
-        anyhow::bail!("config example snapshot_dir must be '/var/lib/mecfeedmcp/snapshots'");
+    if config.snapshot_dir != Path::new("/var/lib/mecfeed-snapshots") {
+        anyhow::bail!("config example snapshot_dir must be '/var/lib/mecfeed-snapshots'");
     }
     if config.misp.is_some() {
         anyhow::bail!("config example must not enable a MISP source");

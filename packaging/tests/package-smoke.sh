@@ -200,6 +200,7 @@ jq -e '. == {"version": 1, "tokens": []}' "$fresh_root/var/lib/mecfeedmcp/tokens
 [[ $(stat -c %a "$fresh_root/etc/mecfeedmcp/audit-hmac.key") == 600 ]] || exit 1
 [[ $(wc -c <"$fresh_root/etc/mecfeedmcp/audit-hmac.key") == 32 ]] || exit 1
 [[ $(stat -c %a "$fresh_root/etc/mecfeedmcp/feed.json.example") == 640 ]] || exit 1
+[[ $(stat -c %a "$fresh_root/var/lib/mecfeed-snapshots") == 2750 ]] || exit 1
 
 stage_root="$work_dir/stage-root"
 mkdir -p "$stage_root/etc/mecfeedmcp" "$stage_root/var/lib/mecfeedmcp" \

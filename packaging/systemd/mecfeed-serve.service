@@ -8,12 +8,14 @@ Type=simple
 User=mecfeed-serve
 Group=mecfeed-serve
 Environment=RUST_LOG=info
+# feed.json stays 0640 root:mecfeedmcp; systemd hands serve a private copy at each start.
+LoadCredential=feed.json:/etc/mecfeedmcp/feed.json
 ExecStart=/usr/local/bin/mecfeed-serve \
     --listen 0.0.0.0:8443 \
     --tls-cert /etc/mecfeed-serve/tls.crt \
     --tls-key /etc/mecfeed-serve/tls.key \
-    --snapshot-dir /var/lib/mecfeed-serve/snapshots \
-    --feed-config /etc/mecfeedmcp/feed.json
+    --snapshot-dir /var/lib/mecfeed-snapshots \
+    --feed-config ${CREDENTIALS_DIRECTORY}/feed.json
 Restart=always
 RestartSec=5s
 TimeoutStopSec=30s
@@ -24,7 +26,7 @@ StateDirectoryMode=0700
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadOnlyPaths=/etc/mecfeed-serve /etc/mecfeedmcp
+ReadOnlyPaths=/etc/mecfeed-serve /var/lib/mecfeed-snapshots
 ReadWritePaths=/var/lib/mecfeed-serve
 PrivateTmp=true
 PrivateDevices=true

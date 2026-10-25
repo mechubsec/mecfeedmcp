@@ -8,7 +8,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 fn default_snapshot_dir() -> PathBuf {
-    PathBuf::from("/var/lib/mecfeedmcp/snapshots")
+    PathBuf::from("/var/lib/mecfeed-snapshots")
 }
 
 /// Operator-authored feed.json. No secrets.
@@ -214,7 +214,7 @@ mod tests {
                 "version": 1,
                 "tenant": "lab",
                 "changeset_state_file": "/var/lib/mecfeedmcp/changeset-state.json",
-                "snapshot_dir": "/var/lib/mecfeedmcp/snapshots",
+                "snapshot_dir": "/var/lib/mecfeed-snapshots",
                 "approval_ttl_secs": 3600,
                 "own_prefixes": [],
                 "allow_cidrs": [],

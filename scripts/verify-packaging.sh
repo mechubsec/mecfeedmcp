@@ -319,10 +319,11 @@ exec_start=$(awk '
 [[ "$exec_start" == "$expected_exec" ]] || fail 'active ExecStart conflicts with loopback/token/audit policy'
 require_service_directive EnvironmentFile /etc/mecfeedmcp/credentials.env
 require_service_directive ReadOnlyPaths /etc/mecfeedmcp
-require_service_directive ReadWritePaths /var/lib/mecfeedmcp
+require_service_directive ReadWritePaths '/var/lib/mecfeedmcp /var/lib/mecfeed-snapshots'
 require 'u mecfeedmcp - "mecfeedmcp service" /var/lib/mecfeedmcp /usr/sbin/nologin' "$sysusers"
 require 'd /etc/mecfeedmcp 0750 root mecfeedmcp -' "$tmpfiles"
 require 'd /var/lib/mecfeedmcp 0700 mecfeedmcp mecfeedmcp -' "$tmpfiles"
+require 'd /var/lib/mecfeed-snapshots 2750 mecfeedmcp mecfeed-serve -' "$tmpfiles"
 # These assertions intentionally match literal shell source fragments.
 # shellcheck disable=SC2016
 require_contains 'install -o root -g mecfeedmcp -m 0640 "$package_dir/config/feed.json.example" "$config_dir/feed.json.example"' "$installer"
