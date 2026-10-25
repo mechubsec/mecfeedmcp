@@ -920,6 +920,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allowlisting_a_historical_entry_does_not_block_reopen() {
+        let fix = fixture();
+        {
+            let publisher = open(&fix, false);
+            let plan = publisher
+                .plan("alice", one("1.0.0.1"), NOW)
+                .await
+                .expect("plan");
+            publisher
+                .approve("bob", true, &plan.change_set_id, &plan.digest)
+                .await
+                .expect("approve");
+            publisher
+                .apply("alice", &attr(), &plan.change_set_id, &plan.digest, NOW)
+                .await
+                .expect("apply");
+        }
+        let allowlisting = Policy::try_new(
+            Vec::new(),
+            vec!["1.0.0.0/24".parse().expect("cidr")],
+            std::iter::empty::<&str>(),
+            Limits::default(),
+        )
+        .expect("policy");
+        let publisher = FeedPublisher::open(
+            &fix.snapshots,
+            &fix.state,
+            allowlisting,
+            "lab",
+            false,
+            Duration::from_secs(900),
+        )
+        .expect("reopen");
+        assert!(publisher.latest().expect("lock").is_some());
+        publisher
+            .plan("alice", one("1.0.0.2"), NOW)
+            .await
+            .expect_err("operator allowlist still applies to new plans");
+    }
+
+    #[tokio::test]
+    async fn a_recorded_broad_exception_reopens_under_default_limits() {
+        let fix = fixture();
+        let permitting = Policy::try_new(
+            Vec::new(),
+            Vec::new(),
+            std::iter::empty::<&str>(),
+            Limits {
+                permit_explicit_broad: true,
+                ..Limits::default()
+            },
+        )
+        .expect("policy");
+        {
+            let publisher = FeedPublisher::open(
+                &fix.snapshots,
+                &fix.state,
+                permitting,
+                "lab",
+                false,
+                Duration::from_secs(900),
+            )
+            .expect("open");
+            let mut proposal = one("1.0.0.0/16");
+            proposal.entries[0].kind = IndicatorKind::Cidr;
+            proposal.entries[0].allow_broad_prefix = true;
+            let plan = publisher.plan("alice", proposal, NOW).await.expect("plan");
+            publisher
+                .approve("bob", true, &plan.change_set_id, &plan.digest)
+                .await
+                .expect("approve");
+            publisher
+                .apply("alice", &attr(), &plan.change_set_id, &plan.digest, NOW)
+                .await
+                .expect("apply");
+        }
+        let publisher = open(&fix, false);
+        assert!(publisher.latest().expect("lock").is_some());
+    }
+
+    #[tokio::test]
     async fn apply_without_approval_writes_nothing() {
         let fix = fixture();
         let publisher = open(&fix, false);

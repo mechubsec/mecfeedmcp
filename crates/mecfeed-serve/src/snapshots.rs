@@ -121,8 +121,13 @@ pub fn load(dir: &Path, policy: Policy) -> Result<Loaded> {
     let current = current_number(dir)?;
     // History is verified under the baseline (chain + hard floors) so a new
     // allowlist entry cannot reject old versions; the operator policy is then
-    // applied to the current snapshot at render.
-    let baseline = Policy::try_new(vec![], vec![], Vec::<&str>::new(), Limits::default())
+    // applied to the current snapshot at render. A recorded broad exception
+    // stays valid; the hard prefix floors still apply.
+    let limits = Limits {
+        permit_explicit_broad: true,
+        ..Limits::default()
+    };
+    let baseline = Policy::try_new(vec![], vec![], Vec::<&str>::new(), limits)
         .context("building baseline policy")?;
     let mut versions = FeedVersions::open(baseline);
     for number in &numbers {
