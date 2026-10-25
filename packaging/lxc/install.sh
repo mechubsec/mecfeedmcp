@@ -400,13 +400,16 @@ if [[ -e "$signing_pub_path" ]]; then
     existing_public_key="${existing_public_key%"${existing_public_key##*[![:space:]]}"}"
     [[ "$existing_public_key" == "$signing_public_key" ]] \
         || die "$signing_pub_path does not match the snapshot signing key; fix trust by hand"
+    reject_unsafe_file "$signing_pub_path"
     chmod 0644 "$signing_pub_path"
     if (( live_install )); then
-        chown root:root "$signing_pub_path"
+        reject_unsafe_file "$signing_pub_path"
+        chown -h root:root "$signing_pub_path"
     fi
 else
     signing_pub_tmp=$(mktemp "$serve_config_dir/.snapshot-signing.pub.XXXXXX")
     printf '%s\n' "$signing_public_key" >"$signing_pub_tmp"
+    reject_unsafe_file "$signing_pub_tmp"
     chmod 0644 "$signing_pub_tmp"
     mv -fT -- "$signing_pub_tmp" "$signing_pub_path"
 fi
