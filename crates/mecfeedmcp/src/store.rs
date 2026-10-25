@@ -1,12 +1,15 @@
 //! Snapshot directory. Writes stay under the directory the caller opened.
-//! A snapshot is current only after its file is re-read and the pointer moves.
+//! A snapshot is current only after its file and signature are re-read and the pointer moves.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use mecfeedmcp_core::{FeedVersions, Limits, Policy, SnapshotDocument, VersionError};
+use mecfeedmcp_core::{
+    FeedVersions, Limits, Policy, SIGNATURE_FILE_NAME, SnapshotDocument, VersionError,
+    parse_signature_file,
+};
 use thiserror::Error;
 
 /// Why a snapshot directory operation failed.
@@ -50,19 +53,24 @@ pub fn open_dir(dir: &Path, policy: Policy) -> Result<(PathBuf, FeedVersions), S
     Ok((canonical, versions))
 }
 
-/// Write `document` without moving the current pointer.
+/// Write version `document.number` and its detached `signature`, re-reading both.
 ///
 /// # Errors
 ///
-/// Returns [`StoreError`] when the file cannot be written and re-read.
-/// A failure removes the version directory.
-pub fn write_snapshot_file(dir: &Path, document: &SnapshotDocument) -> Result<(), StoreError> {
+/// Returns [`StoreError`] when a file cannot be written and re-read, or the
+/// signature does not parse. A failure removes the version directory.
+pub fn write_snapshot_file(
+    dir: &Path,
+    document: &SnapshotDocument,
+    signature: &[u8],
+) -> Result<(), StoreError> {
     let version_dir = version_dir(dir, document.number)?;
     if version_dir.symlink_metadata().is_ok() {
         return Err(StoreError::File);
     }
     fs::create_dir_all(&version_dir).map_err(|_| StoreError::File)?;
-    let published = write_snapshot(&version_dir, document);
+    let published = write_snapshot(&version_dir, document)
+        .and_then(|()| write_signature(&version_dir, signature));
     if published.is_err() {
         let _ = fs::remove_dir_all(&version_dir);
     }
@@ -251,6 +259,25 @@ fn current_number(dir: &Path) -> Result<Option<u64>, StoreError> {
         return Err(StoreError::Log);
     }
     Ok(Some(number))
+}
+
+fn write_signature(version_dir: &Path, signature: &[u8]) -> Result<(), StoreError> {
+    let partial = version_dir.join(format!("{SIGNATURE_FILE_NAME}.partial"));
+    let final_path = version_dir.join(SIGNATURE_FILE_NAME);
+    if is_symlink(&partial) || is_symlink(&final_path) {
+        return Err(StoreError::File);
+    }
+    write_new(&partial, signature)?;
+    fs::rename(&partial, &final_path).map_err(|_| StoreError::File)?;
+    let mut read_back = Vec::new();
+    File::open(&final_path)
+        .and_then(|mut file| file.read_to_end(&mut read_back))
+        .map_err(|_| StoreError::File)?;
+    if read_back != signature || parse_signature_file(&read_back).is_err() {
+        return Err(StoreError::File);
+    }
+    // current must never name a version whose signature is not durable.
+    sync_dir(version_dir)
 }
 
 fn write_new(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {

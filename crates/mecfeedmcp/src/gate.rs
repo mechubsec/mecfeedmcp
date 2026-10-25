@@ -11,6 +11,7 @@ use mecfeedmcp_core::{
     FeedVersions, IndicatorKind, PlannedSnapshot, Policy, Proposal, ProposedEntry,
     SnapshotDocument, SnapshotRow,
 };
+use mecmcp_audit::signing::SigningKey;
 use mecmcp_audit::{ActorType, Attribution};
 use mecmcp_changeset::{
     ApproverIdentity, ChangeSetState, ChangesetCoordinator, CommitOptions, CommitOutcome,
@@ -133,6 +134,7 @@ pub struct FeedPublisher {
 struct Inner {
     versions: FeedVersions,
     snapshot_dir: std::path::PathBuf,
+    signing_key: SigningKey,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +179,7 @@ impl FeedPublisher {
     /// # Errors
     ///
     /// Returns an error when a path or the stored log is not acceptable.
+    /// Every snapshot this publisher writes is signed with signing_key.
     pub fn open(
         snapshot_dir: &Path,
         state_file: &Path,
@@ -184,6 +187,7 @@ impl FeedPublisher {
         device: &str,
         lab_mode: bool,
         approval_ttl: Duration,
+        signing_key: SigningKey,
     ) -> Result<Self, GateError> {
         check_principal(device)?;
         if !state_file.is_absolute() {
@@ -202,6 +206,7 @@ impl FeedPublisher {
             inner: Arc::new(Mutex::new(Inner {
                 versions,
                 snapshot_dir,
+                signing_key,
             })),
             device: device.to_string(),
             lab_mode,
@@ -606,7 +611,10 @@ impl DeviceTransaction for FeedTransaction {
             return Err(TxError::Digest);
         }
         let document = planned.document();
-        store::write_snapshot_file(&inner.snapshot_dir, &document).map_err(|_| TxError::Store)?;
+        let signature = crate::snapshot_key::signature_file(&document.digest, &inner.signing_key)
+            .map_err(|_| TxError::Store)?;
+        store::write_snapshot_file(&inner.snapshot_dir, &document, &signature)
+            .map_err(|_| TxError::Store)?;
         if let Err(error) = inner.versions.commit_planned(&planned, self.now) {
             let _ = store::remove_version(&inner.snapshot_dir, document.number);
             return Err(match error {
@@ -835,6 +843,8 @@ mod tests {
         _dir: tempfile::TempDir,
         snapshots: std::path::PathBuf,
         state: std::path::PathBuf,
+        key: std::path::PathBuf,
+        public: String,
     }
 
     fn policy() -> Policy {
@@ -849,11 +859,33 @@ mod tests {
 
     fn fixture() -> Fixture {
         let dir = tempfile::tempdir().expect("tempdir");
+        let key = dir.path().join("snapshot-signing.key");
+        let (public, _) = crate::init_key_file(&key).expect("signing key");
         Fixture {
             snapshots: dir.path().join("snapshots"),
             state: dir.path().join("changeset-state.json"),
+            key,
+            public,
             _dir: dir,
         }
+    }
+
+    fn signing_key(fix: &Fixture) -> mecmcp_audit::signing::SigningKey {
+        mecmcp_audit::signing::load_signing_key(&fix.key).expect("load signing key")
+    }
+
+    fn assert_signed(fix: &Fixture, version: u64, digest: &str) {
+        let path = fix.snapshots.join(format!(
+            "versions/{version}/{}",
+            mecfeedmcp_core::SIGNATURE_FILE_NAME
+        ));
+        let file = mecfeedmcp_core::parse_signature_file(&fs::read(path).expect("sig"))
+            .expect("parse sig");
+        let trusted = mecfeedmcp_core::TrustedKeys::new(vec![
+            mecfeedmcp_core::PublicKey::from_base64(&fix.public).expect("public key"),
+        ])
+        .expect("trusted");
+        assert_eq!(trusted.verify(digest, &file), Ok(()));
     }
 
     fn open(fix: &Fixture, lab: bool) -> FeedPublisher {
@@ -864,6 +896,7 @@ mod tests {
             "lab",
             lab,
             Duration::from_secs(900),
+            signing_key(fix),
         )
         .expect("open")
     }
@@ -951,6 +984,7 @@ mod tests {
             "lab",
             false,
             Duration::from_secs(900),
+            signing_key(&fix),
         )
         .expect("reopen");
         assert!(publisher.latest().expect("lock").is_some());
@@ -981,6 +1015,7 @@ mod tests {
                 "lab",
                 false,
                 Duration::from_secs(900),
+                signing_key(&fix),
             )
             .expect("open");
             let mut proposal = one("1.0.0.0/16");
@@ -1105,10 +1140,72 @@ mod tests {
             "lab",
             false,
             Duration::from_secs(900),
+            signing_key(&fix),
         ) {
             Err(err) => assert_eq!(err, GateError::Digest),
             Ok(_) => panic!("open accepted a tampered snapshot"),
         }
+    }
+
+    #[tokio::test]
+    async fn apply_writes_a_signature_that_verifies() {
+        let fix = fixture();
+        let publisher = open(&fix, false);
+        let plan = publisher
+            .plan("alice", one("1.0.0.1"), NOW)
+            .await
+            .expect("plan");
+        publisher
+            .approve("bob", true, &plan.change_set_id, &plan.digest)
+            .await
+            .expect("approve");
+        let published = publisher
+            .apply("alice", &attr(), &plan.change_set_id, &plan.digest, NOW)
+            .await
+            .expect("apply");
+        assert_signed(&fix, 1, &published.digest);
+    }
+
+    #[tokio::test]
+    async fn reopen_with_a_rotated_key_keeps_the_log() {
+        let fix = fixture();
+        {
+            let publisher = open(&fix, true);
+            let plan = publisher
+                .plan("alice", one("1.0.0.1"), NOW)
+                .await
+                .expect("plan");
+            publisher
+                .waive("alice", &plan.change_set_id, &plan.digest)
+                .await
+                .expect("waive");
+            publisher
+                .apply("alice", &attr(), &plan.change_set_id, &plan.digest, NOW)
+                .await
+                .expect("apply");
+        }
+        let (rotated, _) = mecmcp_audit::signing::generate_keypair();
+        let publisher = FeedPublisher::open(
+            &fix.snapshots,
+            &fix.state,
+            policy(),
+            "lab",
+            true,
+            Duration::from_secs(900),
+            rotated,
+        )
+        .expect("open ignores signatures");
+        assert!(publisher.latest().expect("lock").is_some());
+    }
+
+    #[test]
+    fn a_signature_that_does_not_parse_removes_the_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut versions = mecfeedmcp_core::FeedVersions::open(policy());
+        versions.publish(&one("1.0.0.1"), NOW).expect("publish");
+        let document = versions.document(1).expect("document");
+        assert!(crate::store::write_snapshot_file(dir.path(), &document, b"not json").is_err());
+        assert!(!dir.path().join("versions/1").exists());
     }
 
     #[tokio::test]
@@ -1158,6 +1255,7 @@ mod tests {
             .await
             .expect("apply rollback");
         assert_eq!(published.version, 3);
+        assert_signed(&fix, 3, &published.digest);
         let latest = publisher.latest().expect("lock").expect("latest");
         assert_eq!(latest.version, 3);
         assert_eq!(latest.entries.len(), 1);

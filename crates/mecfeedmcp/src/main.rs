@@ -40,6 +40,9 @@ struct ServerCli {
         value_parser = clap::value_parser!(u64).range(1..),
     )]
     approval_timeout_secs: u64,
+    /// Ed25519 key that signs each published snapshot (mode 0600, owned by the service user).
+    #[arg(long)]
+    snapshot_signing_key_file: Option<PathBuf>,
 
     /// Validate package configuration and SBOM, then exit.
     #[arg(long)]
@@ -391,8 +394,9 @@ fn validate_startup_credentials(
     credentials_env: Option<&Path>,
     tokens: Option<&Path>,
     audit_hmac_key: Option<&Path>,
+    snapshot_signing_key: Option<&Path>,
 ) -> Result<()> {
-    let mut specs = Vec::with_capacity(4);
+    let mut specs = Vec::with_capacity(5);
     specs.push(CredentialFileSpec {
         path: config,
         role: CredentialFileRole::ConfigNoSecret,
@@ -423,6 +427,14 @@ fn validate_startup_credentials(
             required: true,
         });
     }
+    if let Some(path) = snapshot_signing_key {
+        specs.push(CredentialFileSpec {
+            path,
+            role: CredentialFileRole::Secret,
+            description: "snapshot signing key",
+            required: true,
+        });
+    }
     validate_credential_files(&specs).map_err(anyhow::Error::from)
 }
 
@@ -446,6 +458,7 @@ async fn main() -> Result<()> {
         lab_mode,
         state_file: cli_state_file,
         approval_timeout_secs: cli_approval_timeout_secs,
+        snapshot_signing_key_file,
         validate_package: _,
         enable_metrics,
         max_requests_per_second_per_ip,
@@ -478,6 +491,7 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(|resolved| resolved.path.as_path()),
         args.audit_hmac_key_file.as_deref(),
+        snapshot_signing_key_file.as_deref(),
     )
     .context("credential file validation")?;
 
@@ -545,6 +559,10 @@ async fn main() -> Result<()> {
         anyhow::bail!("approval ttl must be greater than zero");
     }
     let policy = config.policy().context("feed.json policy")?;
+    let signing_key_file = snapshot_signing_key_file
+        .context("--snapshot-signing-key-file is required to publish snapshots")?;
+    let signing_key = mecmcp_audit::signing::load_signing_key(&signing_key_file)
+        .with_context(|| format!("loading {}", signing_key_file.display()))?;
     let publisher = FeedPublisher::open(
         &config.snapshot_dir,
         &state_file,
@@ -552,6 +570,7 @@ async fn main() -> Result<()> {
         &config.tenant,
         lab_mode,
         Duration::from_secs(approval_ttl_secs),
+        signing_key,
     )
     .map_err(|error| anyhow::anyhow!("opening the feed publisher: {error}"))?;
 

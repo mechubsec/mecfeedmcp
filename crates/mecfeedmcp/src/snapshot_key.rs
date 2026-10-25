@@ -121,7 +121,6 @@ pub fn public_key_text(key: &SigningKey) -> Result<(String, String), SnapshotKey
 }
 
 /// The `snapshot.sig` bytes for snapshot `digest`, signed by `key`.
-#[cfg_attr(not(test), allow(dead_code))] // used by gate.rs from the next commit
 pub(crate) fn signature_file(digest: &str, key: &SigningKey) -> Result<Vec<u8>, SnapshotKeyError> {
     let signed = audit_signing::sign_digest(&signing_input(digest)?, key)?;
     let (_, key_id) = public_key_text(key)?;
