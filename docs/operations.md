@@ -31,6 +31,7 @@ The MCP image's `ENTRYPOINT` keeps `--device-mapping`, `--tokens-file`, and
 `--audit-hmac-key-file` so an operator `--host` override cannot drop them.
 `--audit-format json` is the correct audit sink in a container (there is no
 journald socket).
+Mount one host directory at `/var/lib/mecfeed-snapshots` in both containers: writable by uid 65532 for the MCP server, `:ro` for `mecfeed-serve`.
 
 `mecfeed-serve` matches its client allowlist against the TCP peer address.
 Behind Docker NAT that address is the bridge gateway, so the default
@@ -53,7 +54,9 @@ entry. The packaged serve unit reads `feed.json` through
 `UMask=0027` so new snapshots are group-readable by `mecfeed-serve`. Installs from
 before this change kept snapshots in `/var/lib/mecfeedmcp/snapshots`; move them to
 `/var/lib/mecfeed-snapshots`, set owner `mecfeedmcp:mecfeed-serve` with dirs `2750`
-and files `0640`, and set `snapshot_dir` in `feed.json`.
+and files `0640`, and set `snapshot_dir` in `feed.json`. Both unit files changed, so re-run the
+installer with `MECFEEDMCP_FORCE_UNIT=1` (it otherwise keeps a changed unit as customized), then
+restart both services.
 
 ## Tokens and audit
 
