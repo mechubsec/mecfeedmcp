@@ -38,6 +38,12 @@ cat >"$FAKE_PACKAGE/bin/mecfeedmcp" <<'BIN'
 if [ "$1" = "--validate-package" ]; then
     exit 0
 fi
+for arg in "$@"; do
+    case "$arg" in
+        --init-snapshot-signing-key) : >"$2" ;;
+        --print-snapshot-signing-public-key) echo "ZmFrZS1wdWJsaWMta2V5"; exit 0 ;;
+    esac
+done
 echo "fake binary"
 BIN
 chmod +x "$FAKE_PACKAGE/bin/mecfeedmcp" "$FAKE_PACKAGE/packaging/lxc/install.sh"

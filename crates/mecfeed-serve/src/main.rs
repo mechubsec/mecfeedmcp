@@ -18,7 +18,9 @@ use axum::{
 };
 use clap::Parser;
 use ipnet::IpNet;
-use mecfeedmcp_core::{FeedFormat, IndicatorKind, Limits, Policy, render_feed};
+use mecfeedmcp_core::{
+    FeedFormat, IndicatorKind, Limits, Policy, PublicKey, TrustedKeys, render_feed,
+};
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde::{Deserialize, de::IgnoredAny};
@@ -52,9 +54,14 @@ struct Args {
     #[arg(long)]
     feed_config: PathBuf,
 
-    /// Directory of signed, versioned snapshots. May be empty.
+    /// Directory of versioned snapshots; the current one must carry a trusted signature. May be empty.
     #[arg(long)]
     snapshot_dir: PathBuf,
+
+    /// Public key trusted to sign snapshots: a file holding one base64 Ed25519 key.
+    /// Repeatable; at least one is required.
+    #[arg(long = "trusted-snapshot-key", required = true)]
+    trusted_snapshot_key: Vec<PathBuf>,
 
     /// Client IP/CIDR allowlist. Repeatable. Empty means loopback only.
     #[arg(long = "allow-cidr")]
@@ -121,11 +128,32 @@ fn load_policy(path: &std::path::Path) -> Result<Policy> {
     config.policy()
 }
 
+/// Load every `--trusted-snapshot-key` file into one trust list.
+///
+/// # Errors
+///
+/// Returns an error when a file cannot be read or parsed, when none is given,
+/// or when two files hold the same key.
+fn load_trusted_keys(paths: &[PathBuf]) -> Result<TrustedKeys> {
+    let keys = paths
+        .iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading trusted snapshot key {}", path.display()))?;
+            PublicKey::from_base64(&text)
+                .with_context(|| format!("parsing trusted snapshot key {}", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    TrustedKeys::new(keys).context("trusted snapshot keys are not acceptable")
+}
+
 #[derive(Clone)]
 struct App {
     snapshot_dir: PathBuf,
     allow: Vec<IpNet>,
     policy: Policy,
+    /// Keys the current snapshot's signature must verify against.
+    trusted: TrustedKeys,
     /// Serializes reloads so an older load can never overwrite a newer one.
     reload: Arc<tokio::sync::Mutex<()>>,
     /// Last fully verified load. Readers only ever see a complete, verified set.
@@ -156,6 +184,7 @@ async fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("failed to install the rustls ring crypto provider"))?;
 
     let policy = load_policy(&args.feed_config)?;
+    let trusted = load_trusted_keys(&args.trusted_snapshot_key)?;
     let tls = load_tls(&args.tls_cert, &args.tls_key, Arc::new(provider))?;
     let allow = if args.allow_cidr.is_empty() {
         vec![
@@ -174,6 +203,7 @@ async fn main() -> Result<()> {
         snapshot_dir: args.snapshot_dir,
         allow,
         policy,
+        trusted,
         reload: Arc::default(),
         cache: Arc::default(),
     };
@@ -313,8 +343,9 @@ async fn verified(app: &App) -> Result<Arc<Loaded>> {
         return Ok(loaded);
     }
     let policy = app.policy.clone();
+    let trusted = app.trusted.clone();
     let loaded = Arc::new(
-        tokio::task::spawn_blocking(move || snapshots::load(&dir, policy))
+        tokio::task::spawn_blocking(move || snapshots::load(&dir, policy, &trusted))
             .await
             .context("loading snapshots panicked")??,
     );
@@ -422,14 +453,19 @@ async fn feed(
 
 #[cfg(test)]
 mod tests {
-    use super::{App, FeedPolicyConfig, client_allowed, hex, router};
+    use super::{App, FeedPolicyConfig, client_allowed, hex, load_trusted_keys, router};
     use axum::{
         body::{Body, to_bytes},
         extract::connect_info::MockConnectInfo,
         http::{Method, Request, StatusCode, header},
     };
+    use base64::prelude::*;
+    use ed25519_dalek::{Signer, SigningKey};
     use ipnet::IpNet;
-    use mecfeedmcp_core::{FeedVersions, IndicatorKind, Limits, Policy, Proposal, ProposedEntry};
+    use mecfeedmcp_core::{
+        FeedVersions, IndicatorKind, Limits, Policy, Proposal, ProposedEntry, PublicKey,
+        TrustedKeys, encode_signature_file, signed_message,
+    };
     use sha2::{Digest, Sha256};
     use std::{
         net::{IpAddr, SocketAddr},
@@ -473,6 +509,37 @@ mod tests {
             .expect("publish");
     }
 
+    fn test_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn public_text(key: &SigningKey) -> String {
+        BASE64_STANDARD.encode(key.verifying_key().as_bytes())
+    }
+
+    fn trusted(keys: &[&SigningKey]) -> TrustedKeys {
+        TrustedKeys::new(
+            keys.iter()
+                .map(|key| PublicKey::from_base64(&public_text(key)).expect("public key"))
+                .collect(),
+        )
+        .expect("trusted")
+    }
+
+    /// `snapshot.sig` bytes for `digest`, signed by `key`.
+    fn signature_for(key: &SigningKey, digest: &str) -> Vec<u8> {
+        let key_id = PublicKey::from_base64(&public_text(key))
+            .expect("public key")
+            .key_id()
+            .to_string();
+        let signature = key.sign(&signed_message(digest).expect("message"));
+        encode_signature_file(&key_id, &BASE64_STANDARD.encode(signature.to_bytes()))
+    }
+
+    fn sig_path(dir: &Path, version: u64) -> std::path::PathBuf {
+        dir.join(format!("versions/{version}/snapshot.sig"))
+    }
+
     /// Write every version and the `current` pointer, as `mecfeedmcp` does.
     fn write_layout(dir: &Path, versions: &FeedVersions, count: u64, current: u64) {
         for number in 1..=count {
@@ -484,6 +551,11 @@ mod tests {
                 serde_json::to_vec(&document).expect("serialize"),
             )
             .expect("write snapshot");
+            std::fs::write(
+                version_dir.join("snapshot.sig"),
+                signature_for(&test_key(1), &document.digest),
+            )
+            .expect("write signature");
         }
         std::fs::write(dir.join("current"), format!("{current}\n")).expect("write current");
     }
@@ -518,14 +590,49 @@ mod tests {
     }
 
     fn app_with_policy(dir: &Path, peer: [u8; 4], policy: Policy) -> axum::Router {
+        app_with(dir, peer, policy, trusted(&[&test_key(1)]))
+    }
+
+    fn app_with_trust(dir: &Path, keys: TrustedKeys) -> axum::Router {
+        app_with(dir, [127, 0, 0, 1], empty_policy(), keys)
+    }
+
+    fn app_with(dir: &Path, peer: [u8; 4], policy: Policy, keys: TrustedKeys) -> axum::Router {
         router(App {
             snapshot_dir: dir.to_path_buf(),
             allow: vec!["127.0.0.0/8".parse().expect("loopback")],
             policy,
+            trusted: keys,
             reload: std::sync::Arc::default(),
             cache: std::sync::Arc::default(),
         })
         .layer(MockConnectInfo(SocketAddr::from((peer, 1))))
+    }
+
+    fn two_version_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let at = now();
+        let mut versions = feed_versions();
+        publish(
+            &mut versions,
+            at,
+            vec![entry(IndicatorKind::Ip, "1.0.0.1", at, at + DAY)],
+        );
+        publish(
+            &mut versions,
+            at,
+            vec![entry(IndicatorKind::Ip, "1.0.0.3", at, at + DAY)],
+        );
+        write_layout(dir.path(), &versions, 2, 2);
+        dir
+    }
+
+    fn feed_document_digest(dir: &Path, version: u64) -> String {
+        let bytes = std::fs::read(dir.join(format!("versions/{version}/snapshot.json")))
+            .expect("read snapshot");
+        serde_json::from_slice::<mecfeedmcp_core::SnapshotDocument>(&bytes)
+            .expect("parse snapshot")
+            .digest
     }
 
     async fn send(
@@ -550,6 +657,109 @@ mod tests {
 
     fn etag_of(body: &[u8]) -> String {
         format!("\"sha256-{}\"", hex(&Sha256::digest(body)))
+    }
+
+    async fn status_of(app: &axum::Router) -> StatusCode {
+        send(app, Method::GET, "/feeds/panos-edl/address", None)
+            .await
+            .0
+    }
+
+    #[tokio::test]
+    async fn missing_signature_fails_closed() {
+        let dir = one_version_dir();
+        std::fs::remove_file(sig_path(dir.path(), 1)).expect("remove");
+        assert_eq!(
+            status_of(&app(dir.path())).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn signature_by_an_untrusted_key_fails_closed() {
+        let dir = one_version_dir();
+        let digest = feed_document_digest(dir.path(), 1);
+        std::fs::write(
+            sig_path(dir.path(), 1),
+            signature_for(&test_key(9), &digest),
+        )
+        .expect("write");
+        assert_eq!(
+            status_of(&app(dir.path())).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn signature_over_another_digest_fails_closed() {
+        let dir = one_version_dir();
+        let other = "ab".repeat(32);
+        std::fs::write(sig_path(dir.path(), 1), signature_for(&test_key(1), &other))
+            .expect("write");
+        assert_eq!(
+            status_of(&app(dir.path())).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn signature_copied_from_another_version_fails_closed() {
+        let dir = two_version_dir();
+        std::fs::copy(sig_path(dir.path(), 1), sig_path(dir.path(), 2)).expect("copy");
+        assert_eq!(
+            status_of(&app(dir.path())).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bad_historical_signature_is_not_read() {
+        let dir = two_version_dir();
+        std::fs::write(sig_path(dir.path(), 1), b"garbage").expect("write");
+        assert_eq!(status_of(&app(dir.path())).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_signature_fails_closed() {
+        let dir = one_version_dir();
+        let path = sig_path(dir.path(), 1);
+        let real = dir.path().join("real.sig");
+        std::fs::rename(&path, &real).expect("move");
+        std::os::unix::fs::symlink(&real, &path).expect("symlink");
+        assert_eq!(
+            status_of(&app(dir.path())).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn either_of_two_trusted_keys_verifies() {
+        let dir = one_version_dir();
+        let digest = feed_document_digest(dir.path(), 1);
+        std::fs::write(
+            sig_path(dir.path(), 1),
+            signature_for(&test_key(2), &digest),
+        )
+        .expect("write");
+        let keys = trusted(&[&test_key(1), &test_key(2)]);
+        assert_eq!(
+            status_of(&app_with_trust(dir.path(), keys)).await,
+            StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn trusted_key_files_are_checked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let good = dir.path().join("good.pub");
+        let bad = dir.path().join("bad.pub");
+        std::fs::write(&good, format!("{}\n", public_text(&test_key(1)))).expect("write");
+        std::fs::write(&bad, "not a key\n").expect("write");
+        assert!(load_trusted_keys(std::slice::from_ref(&good)).is_ok());
+        assert!(load_trusted_keys(&[]).is_err());
+        assert!(load_trusted_keys(&[good.clone(), good.clone()]).is_err());
+        assert!(load_trusted_keys(&[good, bad]).is_err());
+        assert!(load_trusted_keys(&[dir.path().join("missing.pub")]).is_err());
     }
 
     #[tokio::test]

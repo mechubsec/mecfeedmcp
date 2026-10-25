@@ -15,7 +15,8 @@ ExecStart=/usr/local/bin/mecfeed-serve \
     --tls-cert /etc/mecfeed-serve/tls.crt \
     --tls-key /etc/mecfeed-serve/tls.key \
     --snapshot-dir /var/lib/mecfeed-snapshots \
-    --feed-config ${CREDENTIALS_DIRECTORY}/feed.json
+    --feed-config ${CREDENTIALS_DIRECTORY}/feed.json \
+    --trusted-snapshot-key /etc/mecfeed-serve/snapshot-signing.pub
 Restart=always
 RestartSec=5s
 TimeoutStopSec=30s

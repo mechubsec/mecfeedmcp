@@ -51,7 +51,7 @@
           "isRequired": true,
           "variables": {
             "state_dir": {
-              "description": "Absolute host directory for tokens and the audit HMAC key. Must be writable by UID 65532.",
+              "description": "Absolute host directory for tokens and the audit HMAC key. Must be writable by UID 65532. Holds snapshot-signing.key; create it once with --init-snapshot-signing-key and give mecfeed-serve its public half.",
               "format": "filepath",
               "isRequired": true
             }

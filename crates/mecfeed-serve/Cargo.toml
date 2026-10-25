@@ -25,6 +25,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true
 rcgen = "0.14.10"
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }

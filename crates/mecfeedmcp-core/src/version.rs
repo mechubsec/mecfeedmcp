@@ -646,7 +646,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     to_hex(Sha256::digest(bytes).as_slice())
 }
 
-fn to_hex(bytes: &[u8]) -> String {
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

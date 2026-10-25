@@ -792,6 +792,7 @@ mod tests {
                 "lab",
                 false,
                 Duration::from_secs(900),
+                mecmcp_audit::signing::generate_keypair().0,
             )
             .expect("open"),
         );
