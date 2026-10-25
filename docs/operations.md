@@ -105,12 +105,16 @@ Change flags in a drop-in (`systemctl edit mecfeedmcp`, `systemctl edit
 mecfeed-serve`) that sets an empty `ExecStart=` and then the full new
 `ExecStart=`.
 
-1. Create a new key at a new path; this prints the new public key, so save it
-   as the second `.pub`:
-   `runuser -u mecfeedmcp -- mecfeedmcp --snapshot-signing-key-file /var/lib/mecfeedmcp/<new-name>.key --init-snapshot-signing-key`
-2. Add that `.pub` as a second `--trusted-snapshot-key` on serve (drop-in),
+1. As root, create a new key at a new path and install its public key under
+   `/etc/mecfeed-serve` as `root:root` mode `0644`, so serve can read it and no
+   unprivileged account can change it:
+   `runuser -u mecfeedmcp -- mecfeedmcp --snapshot-signing-key-file /var/lib/mecfeedmcp/<new-name>.key --init-snapshot-signing-key | install -o root -g root -m 0644 /dev/stdin /etc/mecfeed-serve/<new-name>.pub`
+2. Copy serve's current `ExecStart` (from `systemctl cat mecfeed-serve`) into
+   the drop-in and add only `--trusted-snapshot-key /etc/mecfeed-serve/<new-name>.pub`,
    then `systemctl daemon-reload` and restart serve.
-3. Point the MCP unit at the new key (drop-in), then `systemctl daemon-reload`
+3. Copy the MCP unit's current `ExecStart` (from `systemctl cat mecfeedmcp`)
+   into the drop-in and change only `--snapshot-signing-key-file` to the new
+   key, then `systemctl daemon-reload`
    and restart it.
 4. Publish one version.
 5. Remove the old `--trusted-snapshot-key` (drop-in), then
