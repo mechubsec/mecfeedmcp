@@ -168,7 +168,7 @@ require_service_directive() {
 validate_service() {
     local expected exec_start
     # shellcheck disable=SC2016  # $STATE_DIRECTORY is a systemd variable, not a shell expansion
-    expected='/usr/local/bin/mecfeedmcp --device-mapping /etc/mecfeedmcp/feed.json --transport streamable-http --host 127.0.0.1 --port 30040 --tokens-file /var/lib/mecfeedmcp/tokens.json --audit-format json --audit-journald --audit-log-file $STATE_DIRECTORY/audit.jsonl --audit-redact devices=hmac --audit-hmac-key-file /etc/mecfeedmcp/audit-hmac.key'
+    expected='/usr/local/bin/mecfeedmcp --device-mapping /etc/mecfeedmcp/feed.json --transport streamable-http --host 127.0.0.1 --port 30040 --tokens-file /var/lib/mecfeedmcp/tokens.json --audit-format json --audit-journald --audit-log-file ${STATE_DIRECTORY}/audit.jsonl --audit-redact devices=hmac --audit-hmac-key-file /etc/mecfeedmcp/audit-hmac.key'
     exec_start=$(extract_exec_start | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//') || die 'unit has invalid ExecStart'
     [[ "$exec_start" == "$expected" ]] || die 'unit ExecStart does not match the package policy'
     require_service_directive EnvironmentFile /etc/mecfeedmcp/credentials.env
@@ -473,7 +473,7 @@ fi
 printf '%s\n' \
     'Installation complete. Next steps:' \
     '1. Create config: install -o root -g mecfeedmcp -m 0640 /etc/mecfeedmcp/feed.json.example /etc/mecfeedmcp/feed.json, then edit /etc/mecfeedmcp/feed.json.' \
-    '2. Install /etc/mecfeedmcp/credentials.env with mode 0600; do not put credentials in JSON.' \
+    '2. Install /etc/mecfeedmcp/credentials.env owned by mecfeedmcp, mode 0600: install -o mecfeedmcp -g mecfeedmcp -m 0600 /dev/null /etc/mecfeedmcp/credentials.env. Do not put credentials in JSON.' \
     '3. Mint a least-privilege token as root, then start mecfeedmcp manually after configuration.' \
     '4. Configure remote journal forwarding before handling production traffic.' \
     'MCP endpoint: http://127.0.0.1:30040/mcp'

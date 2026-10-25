@@ -183,7 +183,7 @@ ci=.github/workflows/ci.yml
 tmpfiles=packaging/systemd/mecfeedmcp.tmpfiles
 sysusers=packaging/systemd/mecfeedmcp.sysusers
 # shellcheck disable=SC2016  # $STATE_DIRECTORY is a systemd variable, not a shell expansion
-expected_exec='/usr/local/bin/mecfeedmcp --device-mapping /etc/mecfeedmcp/feed.json --transport streamable-http --host 127.0.0.1 --port 30040 --tokens-file /var/lib/mecfeedmcp/tokens.json --audit-format json --audit-journald --audit-log-file $STATE_DIRECTORY/audit.jsonl --audit-redact devices=hmac --audit-hmac-key-file /etc/mecfeedmcp/audit-hmac.key'
+expected_exec='/usr/local/bin/mecfeedmcp --device-mapping /etc/mecfeedmcp/feed.json --transport streamable-http --host 127.0.0.1 --port 30040 --tokens-file /var/lib/mecfeedmcp/tokens.json --audit-format json --audit-journald --audit-log-file ${STATE_DIRECTORY}/audit.jsonl --audit-redact devices=hmac --audit-hmac-key-file /etc/mecfeedmcp/audit-hmac.key'
 
 assert_upload_step_policy() {
     local mutated condition
@@ -317,6 +317,11 @@ exec_start=$(awk '
     END { if (found != 1) exit 2 }
 ' "$service" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//') || fail 'unit must contain one complete ExecStart'
 [[ "$exec_start" == "$expected_exec" ]] || fail 'active ExecStart conflicts with loopback/token/audit policy'
+# systemd expands an unbraced $VAR only as a whole word; $STATE_DIRECTORY/x fails the unit at start.
+# shellcheck disable=SC2016
+if grep -nE '\$[A-Za-z_][A-Za-z0-9_]*[^A-Za-z0-9_[:space:]\\]' packaging/systemd/*.service packaging/systemd/*.example; then
+    fail 'a unit uses $VAR inside a word; systemd needs ${VAR} there'
+fi
 require_service_directive EnvironmentFile /etc/mecfeedmcp/credentials.env
 require_service_directive ReadOnlyPaths /etc/mecfeedmcp
 require_service_directive ReadWritePaths '/var/lib/mecfeedmcp /var/lib/mecfeed-snapshots'

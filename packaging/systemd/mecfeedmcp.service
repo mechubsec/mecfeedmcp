@@ -17,7 +17,7 @@ ExecStart=/usr/local/bin/mecfeedmcp \
     --tokens-file /var/lib/mecfeedmcp/tokens.json \
     --audit-format json \
     --audit-journald \
-    --audit-log-file $STATE_DIRECTORY/audit.jsonl \
+    --audit-log-file ${STATE_DIRECTORY}/audit.jsonl \
     --audit-redact devices=hmac \
     --audit-hmac-key-file /etc/mecfeedmcp/audit-hmac.key
 ExecReload=/bin/kill -HUP $MAINPID
