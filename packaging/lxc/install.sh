@@ -473,7 +473,7 @@ fi
 printf '%s\n' \
     'Installation complete. Next steps:' \
     '1. Create config: install -o root -g mecfeedmcp -m 0640 /etc/mecfeedmcp/feed.json.example /etc/mecfeedmcp/feed.json, then edit /etc/mecfeedmcp/feed.json.' \
-    '2. Install /etc/mecfeedmcp/credentials.env owned by mecfeedmcp, mode 0600: install -o mecfeedmcp -g mecfeedmcp -m 0600 /dev/null /etc/mecfeedmcp/credentials.env. Do not put credentials in JSON.' \
+    '2. Create or fix /etc/mecfeedmcp/credentials.env without truncating it: touch, chown mecfeedmcp:mecfeedmcp, then chmod 0600 it. Do not put credentials in JSON.' \
     '3. Mint a least-privilege token as root, then start mecfeedmcp manually after configuration.' \
     '4. Configure remote journal forwarding before handling production traffic.' \
     'MCP endpoint: http://127.0.0.1:30040/mcp'
