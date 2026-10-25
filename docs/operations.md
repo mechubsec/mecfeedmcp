@@ -55,9 +55,18 @@ entry. The packaged serve unit reads `feed.json` through
 before this change kept snapshots in `/var/lib/mecfeedmcp/snapshots`. To upgrade, stop
 both services first so no publish lands in the old tree. Re-run the installer with
 `MECFEEDMCP_FORCE_UNIT=1`: both unit files changed, and it otherwise keeps a changed
-unit as customized. Move the snapshots to `/var/lib/mecfeed-snapshots`, set owner
-`mecfeedmcp:mecfeed-serve` with dirs `2750` and files `0640`, set `snapshot_dir` in
-`feed.json`, then start both services.
+unit as customized. The installer creates `/var/lib/mecfeed-snapshots`, so move the
+old tree's contents into it rather than the tree itself:
+
+```sh
+mv /var/lib/mecfeedmcp/snapshots/current /var/lib/mecfeedmcp/snapshots/versions /var/lib/mecfeed-snapshots/
+chown -R mecfeedmcp:mecfeed-serve /var/lib/mecfeed-snapshots
+find /var/lib/mecfeed-snapshots -type d -exec chmod 2750 {} +
+find /var/lib/mecfeed-snapshots -type f -exec chmod 0640 {} +
+```
+
+Then set `snapshot_dir` to `/var/lib/mecfeed-snapshots` in `feed.json` and start both
+services.
 
 ## Tokens and audit
 
