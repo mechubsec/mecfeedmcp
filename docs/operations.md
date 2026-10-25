@@ -133,6 +133,40 @@ rotated key's path in a drop-in, and do not replace the key at the default path
 while an old `.pub` sits at the default `.pub` path: the installer stops on a
 `.pub` that does not match the key.
 
+Rotation (Docker). The images fix the key paths in `ENTRYPOINT`, and
+`--snapshot-signing-key-file` cannot be given twice, so the new key is made in a
+separate directory and moved into place. Arguments after the image name replace
+`CMD`, so serve's `--listen 0.0.0.0:8443` must be passed again.
+
+1. Create the new key in an empty directory owned by 65532 with mode `0700`,
+   and keep its public half:
+
+   ```sh
+   mkdir -m 0700 next && sudo chown 65532:65532 next
+   pub=$(docker run --rm -v "$PWD/next:/var/lib/mecfeedmcp" --user 65532:65532 <mcp image> --init-snapshot-signing-key) \
+     && printf '%s\n' "$pub" | install -m 0644 /dev/stdin next.pub
+   ```
+
+   A failed init writes no `next.pub`.
+
+2. Recreate serve trusting both keys. `docker restart` cannot change mounts or
+   arguments, so stop and remove the container, then `docker run` it again with
+   its usual options plus `-v "$PWD/next.pub:/etc/mecfeed-serve/next.pub:ro"`
+   and, after the image name,
+   `--listen 0.0.0.0:8443 --trusted-snapshot-key /etc/mecfeed-serve/next.pub`.
+3. Stop the MCP container, replace the key in its state directory (the host
+   path mounted at `/var/lib/mecfeedmcp`), and start it. A plain `cp` as root
+   leaves the key owned by root, and the container cannot read it:
+
+   ```sh
+   sudo install -o 65532 -g 65532 -m 0600 next/snapshot-signing.key <state dir>/snapshot-signing.key
+   ```
+
+4. Publish one version.
+5. Replace the mounted `snapshot-signing.pub` with `next.pub` (`0644`) and
+   recreate serve as before, without the extra mount and flag. Then
+   `sudo rm -r next`.
+
 Upgrading from an unsigned release (systemd/LXC):
 
 1. `systemctl stop mecfeed-serve mecfeedmcp`
