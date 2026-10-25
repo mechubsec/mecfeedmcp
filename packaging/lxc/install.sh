@@ -9,7 +9,7 @@ die() {
 }
 
 cleanup_tmp_files() {
-    rm -f "${tokens_tmp:-}" "${hmac_tmp:-}"
+    rm -f "${tokens_tmp:-}" "${hmac_tmp:-}" "${signing_pub_tmp:-}"
 }
 trap cleanup_tmp_files EXIT
 
@@ -168,7 +168,7 @@ require_service_directive() {
 validate_service() {
     local expected exec_start
     # shellcheck disable=SC2016  # $STATE_DIRECTORY is a systemd variable, not a shell expansion
-    expected='/usr/local/bin/mecfeedmcp --device-mapping /etc/mecfeedmcp/feed.json --transport streamable-http --host 127.0.0.1 --port 30040 --tokens-file /var/lib/mecfeedmcp/tokens.json --audit-format json --audit-journald --audit-log-file ${STATE_DIRECTORY}/audit.jsonl --audit-redact devices=hmac --audit-hmac-key-file /etc/mecfeedmcp/audit-hmac.key'
+    expected='/usr/local/bin/mecfeedmcp --device-mapping /etc/mecfeedmcp/feed.json --transport streamable-http --host 127.0.0.1 --port 30040 --tokens-file /var/lib/mecfeedmcp/tokens.json --audit-format json --audit-journald --audit-log-file ${STATE_DIRECTORY}/audit.jsonl --audit-redact devices=hmac --audit-hmac-key-file /etc/mecfeedmcp/audit-hmac.key --snapshot-signing-key-file /var/lib/mecfeedmcp/snapshot-signing.key'
     exec_start=$(extract_exec_start | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//') || die 'unit has invalid ExecStart'
     [[ "$exec_start" == "$expected" ]] || die 'unit ExecStart does not match the package policy'
     require_service_directive EnvironmentFile /etc/mecfeedmcp/credentials.env
@@ -206,6 +206,9 @@ unit_path=$(target_path /etc/systemd/system/mecfeedmcp.service)
 tokens_path=$(target_path /var/lib/mecfeedmcp/tokens.json)
 legacy_tokens_path=$(target_path /etc/mecfeedmcp/tokens.json)
 hmac_path=$(target_path /etc/mecfeedmcp/audit-hmac.key)
+signing_key_path=$(target_path /var/lib/mecfeedmcp/snapshot-signing.key)
+serve_config_dir=$(target_path /etc/mecfeed-serve)
+signing_pub_path="$serve_config_dir/snapshot-signing.pub"
 
 reject_unsafe_directory() {
     local path=$1
@@ -241,7 +244,7 @@ reject_unsafe_parent_dirs "$state_dir/.parent-validation"
 reject_unsafe_parent_dirs "$snapshot_dir/.parent-validation"
 managed_destinations=(
     "$bin_path" "$config_dir/feed.json.example" "$sysusers_path" "$tmpfiles_path"
-    "$unit_path" "$tokens_path" "$hmac_path"
+    "$unit_path" "$tokens_path" "$hmac_path" "$signing_key_path" "$signing_pub_path"
 )
 for destination in "${managed_destinations[@]}"; do
     reject_unsafe_file "$destination"
@@ -366,6 +369,40 @@ if [[ -e "$tokens_path" ]]; then
     fi
 fi
 
+# The MCP server signs snapshots with a key only it can read; serve trusts the
+# public half. A key is created once and never replaced; a .pub that no longer
+# matches the key is an operator decision, so the installer stops.
+run_as_service_user() {
+    if (( live_install )); then
+        runuser -u mecfeedmcp -- "$@"
+    else
+        "$@"
+    fi
+}
+if [[ -L "$serve_config_dir" ]] || { [[ -e "$serve_config_dir" ]] && [[ ! -d "$serve_config_dir" ]]; }; then
+    die "unsafe directory: $serve_config_dir"
+fi
+[[ -d "$serve_config_dir" ]] || install -d -m 0755 "$serve_config_dir"
+reject_unsafe_file "$signing_key_path"
+reject_unsafe_file "$signing_pub_path"
+if [[ ! -e "$signing_key_path" ]]; then
+    run_as_service_user "$bin_path" --snapshot-signing-key-file "$signing_key_path" \
+        --init-snapshot-signing-key >/dev/null \
+        || die 'cannot create the snapshot signing key'
+fi
+signing_public_key=$(run_as_service_user "$bin_path" --snapshot-signing-key-file "$signing_key_path" \
+    --print-snapshot-signing-public-key 2>/dev/null) \
+    || die 'cannot read the snapshot signing key'
+if [[ -e "$signing_pub_path" ]]; then
+    [[ $(tr -d '[:space:]' <"$signing_pub_path") == "$signing_public_key" ]] \
+        || die "$signing_pub_path does not match the snapshot signing key; fix trust by hand"
+else
+    signing_pub_tmp=$(mktemp "$serve_config_dir/.snapshot-signing.pub.XXXXXX")
+    printf '%s\n' "$signing_public_key" >"$signing_pub_tmp"
+    chmod 0644 "$signing_pub_tmp"
+    mv -fT -- "$signing_pub_tmp" "$signing_pub_path"
+fi
+
 if [[ -e "$unit_path" ]] && ! cmp -s "$unit_path" "$package_dir/packaging/systemd/mecfeedmcp.service" && [[ "$force_unit" != 1 ]]; then
     printf '%s\n' "preserving customized unit: $unit_path"
 else
@@ -476,4 +513,5 @@ printf '%s\n' \
     '2. Create or fix /etc/mecfeedmcp/credentials.env without truncating it: touch, chown mecfeedmcp:mecfeedmcp, then chmod 0600 it. Do not put credentials in JSON.' \
     '3. Mint a least-privilege token as root, then start mecfeedmcp manually after configuration.' \
     '4. Configure remote journal forwarding before handling production traffic.' \
+    "5. Snapshot signing public key (copy $signing_pub_path to any mecfeed-serve on another host): $signing_public_key" \
     'MCP endpoint: http://127.0.0.1:30040/mcp'

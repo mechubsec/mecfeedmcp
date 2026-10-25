@@ -201,6 +201,13 @@ jq -e '. == {"version": 1, "tokens": []}' "$fresh_root/var/lib/mecfeedmcp/tokens
 [[ $(wc -c <"$fresh_root/etc/mecfeedmcp/audit-hmac.key") == 32 ]] || exit 1
 [[ $(stat -c %a "$fresh_root/etc/mecfeedmcp/feed.json.example") == 640 ]] || exit 1
 [[ $(stat -c %a "$fresh_root/var/lib/mecfeed-snapshots") == 2750 ]] || exit 1
+fresh_key="$fresh_root/var/lib/mecfeedmcp/snapshot-signing.key"
+fresh_pub="$fresh_root/etc/mecfeed-serve/snapshot-signing.pub"
+[[ $(stat -c %a "$fresh_key") == 600 ]] || exit 1
+[[ $(stat -c %a "$fresh_pub") == 644 ]] || exit 1
+[[ $("$fresh_root/usr/local/bin/mecfeedmcp" --snapshot-signing-key-file "$fresh_key" \
+    --print-snapshot-signing-public-key 2>/dev/null) == "$(cat "$fresh_pub")" ]] || exit 1
+grep -Fq "5. Snapshot signing public key" "$fresh_output"
 
 stage_root="$work_dir/stage-root"
 mkdir -p "$stage_root/etc/mecfeedmcp" "$stage_root/var/lib/mecfeedmcp" \
@@ -221,14 +228,30 @@ preserved=(
 )
 sha256sum "${preserved[@]}" >"$work_dir/preserved.sha256"
 
-for _ in 1 2; do
+stage_install() {
     MECFEEDMCP_INSTALL_ROOT="$stage_root" \
     MECFEEDMCP_INSTALL_SKIP_USER=1 \
     MECFEEDMCP_INSTALL_SKIP_SYSTEMD_RELOAD=1 \
     MECFEEDMCP_INSTALL_SKIP_RUNTIME_DEPS=1 \
-        "$installer" >/dev/null
-done
+        "$installer"
+}
+stage_install >/dev/null
+stage_key="$stage_root/var/lib/mecfeedmcp/snapshot-signing.key"
+stage_pub="$stage_root/etc/mecfeed-serve/snapshot-signing.pub"
+[[ -f "$stage_key" && -f "$stage_pub" ]] || exit 1
+signing_files=("$stage_key" "$stage_pub")
+sha256sum "${signing_files[@]}" >"$work_dir/signing.sha256"
+stage_install >/dev/null
 sha256sum -c "$work_dir/preserved.sha256" >/dev/null
+sha256sum -c "$work_dir/signing.sha256" >/dev/null
+
+# A .pub that no longer matches the key must stop the installer, key untouched.
+cp -- "$fresh_pub" "$stage_pub"
+if stage_install >/dev/null 2>&1; then
+    printf '%s\n' 'installer accepted a signing .pub that does not match the key' >&2
+    exit 1
+fi
+grep -F "$stage_key" "$work_dir/signing.sha256" | sha256sum -c - >/dev/null
 
 unsafe_root="$work_dir/unsafe-root"
 sentinel_dir="$work_dir/sentinels"
@@ -249,6 +272,20 @@ fi
 printf '%s\n' token-sentinel | cmp -s - "$sentinel_dir/tokens"
 printf '%s\n' hmac-sentinel | cmp -s - "$sentinel_dir/hmac"
 [[ $(stat -c %a "$sentinel_dir/tokens") == 644 ]] || exit 1
+[[ $(stat -c %a "$sentinel_dir/hmac") == 644 ]] || exit 1
+
+pub_unsafe_root="$work_dir/pub-unsafe-root"
+mkdir -p "$pub_unsafe_root/etc/mecfeed-serve"
+ln -s "$sentinel_dir/hmac" "$pub_unsafe_root/etc/mecfeed-serve/snapshot-signing.pub"
+if MECFEEDMCP_INSTALL_ROOT="$pub_unsafe_root" \
+    MECFEEDMCP_INSTALL_SKIP_USER=1 \
+    MECFEEDMCP_INSTALL_SKIP_SYSTEMD_RELOAD=1 \
+    MECFEEDMCP_INSTALL_SKIP_RUNTIME_DEPS=1 \
+    "$installer" >/dev/null 2>&1; then
+    printf '%s\n' 'installer accepted an unsafe signing public key destination' >&2
+    exit 1
+fi
+printf '%s\n' hmac-sentinel | cmp -s - "$sentinel_dir/hmac"
 [[ $(stat -c %a "$sentinel_dir/hmac") == 644 ]] || exit 1
 
 parent_unsafe_root="$work_dir/parent-unsafe-root"

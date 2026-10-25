@@ -183,7 +183,7 @@ ci=.github/workflows/ci.yml
 tmpfiles=packaging/systemd/mecfeedmcp.tmpfiles
 sysusers=packaging/systemd/mecfeedmcp.sysusers
 # shellcheck disable=SC2016  # $STATE_DIRECTORY is a systemd variable, not a shell expansion
-expected_exec='/usr/local/bin/mecfeedmcp --device-mapping /etc/mecfeedmcp/feed.json --transport streamable-http --host 127.0.0.1 --port 30040 --tokens-file /var/lib/mecfeedmcp/tokens.json --audit-format json --audit-journald --audit-log-file ${STATE_DIRECTORY}/audit.jsonl --audit-redact devices=hmac --audit-hmac-key-file /etc/mecfeedmcp/audit-hmac.key'
+expected_exec='/usr/local/bin/mecfeedmcp --device-mapping /etc/mecfeedmcp/feed.json --transport streamable-http --host 127.0.0.1 --port 30040 --tokens-file /var/lib/mecfeedmcp/tokens.json --audit-format json --audit-journald --audit-log-file ${STATE_DIRECTORY}/audit.jsonl --audit-redact devices=hmac --audit-hmac-key-file /etc/mecfeedmcp/audit-hmac.key --snapshot-signing-key-file /var/lib/mecfeedmcp/snapshot-signing.key'
 
 assert_upload_step_policy() {
     local mutated condition
@@ -322,6 +322,9 @@ exec_start=$(awk '
 if grep -nE '\$[A-Za-z_][A-Za-z0-9_]*[^A-Za-z0-9_[:space:]\\]' packaging/systemd/*.service packaging/systemd/*.example; then
     fail 'a unit uses $VAR inside a word; systemd needs ${VAR} there'
 fi
+require '    --trusted-snapshot-key /etc/mecfeed-serve/snapshot-signing.pub' packaging/systemd/mecfeed-serve.service
+require_contains '--init-snapshot-signing-key' "$installer"
+require_contains '--print-snapshot-signing-public-key' "$installer"
 require_service_directive EnvironmentFile /etc/mecfeedmcp/credentials.env
 require_service_directive ReadOnlyPaths /etc/mecfeedmcp
 require_service_directive ReadWritePaths '/var/lib/mecfeedmcp /var/lib/mecfeed-snapshots'

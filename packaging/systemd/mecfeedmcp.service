@@ -19,7 +19,8 @@ ExecStart=/usr/local/bin/mecfeedmcp \
     --audit-journald \
     --audit-log-file ${STATE_DIRECTORY}/audit.jsonl \
     --audit-redact devices=hmac \
-    --audit-hmac-key-file /etc/mecfeedmcp/audit-hmac.key
+    --audit-hmac-key-file /etc/mecfeedmcp/audit-hmac.key \
+    --snapshot-signing-key-file /var/lib/mecfeedmcp/snapshot-signing.key
 ExecReload=/bin/kill -HUP $MAINPID
 # SIGHUP is the token/audit reload path; restart if it arrives during startup.
 Restart=always

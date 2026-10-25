@@ -76,7 +76,10 @@ fn create_staging_file(path: &Path, file_name: &OsStr) -> std::io::Result<(PathB
     for attempt in 0..64 {
         let mut temp_name = OsString::from(".");
         temp_name.push(file_name);
-        temp_name.push(format!(".{}.{attempt}.partial", std::process::id()));
+        temp_name.push(format!(
+            ".{}.{attempt}.partial",
+            uuid::Uuid::new_v4().simple()
+        ));
         let temp_path = path.with_file_name(temp_name);
         match OpenOptions::new()
             .write(true)
@@ -182,7 +185,7 @@ mod tests {
     #[test]
     fn init_ignores_a_stale_partial_file_and_leaves_no_temp() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let stale_name = format!(".snapshot-signing.key.{}.0.partial", std::process::id());
+        let stale_name = ".snapshot-signing.key.stale.0.partial".to_string();
         let stale = dir.path().join(&stale_name);
         fs::write(&stale, b"junk").expect("stale");
         let path = dir.path().join("snapshot-signing.key");
