@@ -237,13 +237,14 @@ stage_install() {
 }
 stage_install >/dev/null 2>"$work_dir/stale-unit.err"
 grep -Fq -- 'lacks --snapshot-signing-key-file' "$work_dir/stale-unit.err"
-grep -Fq 'snapshot signing key id:' "$work_dir/stale-unit.err"
 stage_key="$stage_root/var/lib/mecfeedmcp/snapshot-signing.key"
 stage_pub="$stage_root/etc/mecfeed-serve/snapshot-signing.pub"
 [[ -f "$stage_key" && -f "$stage_pub" ]] || exit 1
 signing_files=("$stage_key" "$stage_pub")
 sha256sum "${signing_files[@]}" >"$work_dir/signing.sha256"
-stage_install >/dev/null
+# The key exists now, so only --print runs; its stderr must still reach the operator.
+stage_install >/dev/null 2>"$work_dir/reinstall.err"
+grep -Fq 'snapshot signing key id:' "$work_dir/reinstall.err"
 sha256sum -c "$work_dir/preserved.sha256" >/dev/null
 sha256sum -c "$work_dir/signing.sha256" >/dev/null
 if grep -Fq -- 'lacks --trusted-snapshot-key' "$work_dir/stale-unit.err"; then
