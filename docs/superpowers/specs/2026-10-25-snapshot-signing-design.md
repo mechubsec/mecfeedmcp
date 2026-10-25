@@ -38,7 +38,7 @@ Each version directory gets one new file:
 {"version": 1, "key_id": "<16 lowercase hex>", "signature": "<standard base64 Ed25519 signature>"}
 ```
 
-- `digest` is the 32 raw bytes of the snapshot document's existing `sha256:<hex>` digest.
+- `digest` is the snapshot document's existing `digest` field (64 lowercase hex characters, no prefix), decoded to 32 bytes.
 - The signed message is `M = SHA-256(b"mecfeedmcp-snapshot-v1\0" || digest)`, 32 bytes. Ed25519 signs `M`.
   - The label keeps a snapshot signature from ever being valid as a mecmcp audit-head signature, or the reverse, if one key were reused.
   - mecmcp-audit's `sign_digest(s, key)` signs the 32 bytes decoded from `s`. The MCP server therefore calls it with `s = "sha256:" + hex(M)`.
@@ -55,35 +55,36 @@ Each version directory gets one new file:
 
 A new module `mecfeedmcp-core::signature` holds the pure functions, so the signer and the verifier cannot drift:
 
-- `signed_message(digest: &str) -> Result<[u8; 32], SignatureError>`: parses `sha256:<hex>` and returns `M`.
-- `key_id(public_key: &[u8; 32]) -> String`.
+- `signed_message(digest: &str) -> Result<[u8; 32], SignatureError>`: parses the 64-hex digest and returns `M`.
+- `signing_input(digest: &str) -> Result<String, SignatureError>`: `"sha256:" + hex(M)`, the exact string mecmcp-audit's `sign_digest` takes.
+- `PublicKey::from_base64(text) -> Result<PublicKey, SignatureError>`: trims, decodes, and rejects weak keys. `PublicKey::key_id()` returns the 16-hex id.
 - `parse_signature_file(bytes: &[u8]) -> Result<SignatureFile, SignatureError>`: applies the size cap and strict parse.
-- `TrustedKeys`: built from a list of base64 public keys. It rejects malformed keys and duplicate `key_id`s.
+- `TrustedKeys::new(Vec<PublicKey>) -> Result<TrustedKeys, SignatureError>`: rejects an empty list and duplicate `key_id`s.
 - `TrustedKeys::verify(digest, &SignatureFile) -> Result<(), SignatureError>`:
   - selects the key by `key_id`
   - checks with `ed25519_dalek::VerifyingKey::verify_strict` over `M`
-- `SignatureError` variants: `Malformed`, `UnknownKey`, `BadSignature`, `InvalidDigest`, `InvalidKey`, `DuplicateKey`.
-- `encode_signature_file(key_id, signature_bytes) -> Vec<u8>`.
+- `SignatureError` variants: `InvalidDigest`, `InvalidKey`, `NoKeys`, `DuplicateKey`, `Malformed`, `UnknownKey`, `BadSignature`.
+- `encode_signature_file(key_id: &str, signature_base64: &str) -> Vec<u8>`.
 
-Core gains `ed25519-dalek` (3.0.0) and `base64` (0.23.1). Both are already in `Cargo.lock` through mecmcp-audit, so no new crate versions enter the build. mecfeed-serve keeps no dependency on the mecmcp crates.
+Core gains `ed25519-dalek` (3.0.0), `base64` (0.23.1) and `serde_json`. All three are already in `Cargo.lock`, the first two through mecmcp-audit, so no new crate versions enter the build. mecfeed-serve keeps no dependency on the mecmcp crates.
 
 ## 2. MCP server (signer)
 
-- **New required flag** `--snapshot-signing-key-file <path>`.
+- **New flag** `--snapshot-signing-key-file <path>`. It is optional to clap, so `token` and `--validate-package` still work without it, but serving bails without it.
   - Packaged path: `/var/lib/mecfeedmcp/snapshot-signing.key`, mode 0600, owner mecfeedmcp.
-  - The key loads at startup with mecmcp-audit `load_signing_key`, which fails closed on mode and owner. If the key is missing or invalid, the server refuses to start and names the path.
+  - At startup the key file joins the existing `validate_startup_credentials` check as `CredentialFileRole::Secret` (0600, owner is the running user), then loads with mecmcp-audit `load_signing_key`. If the key is missing or invalid, the server refuses to start and names the path.
   - The server never generates a key.
-- **New subcommands:**
-  - `mecfeedmcp snapshot-key init --key-file <path>`:
+- **New action flags.** mecmcp's shared CLI owns the subcommand enum, so these follow the existing `--validate-package` pattern. Each acts on `--snapshot-signing-key-file` and exits:
+  - `--init-snapshot-signing-key`:
     - creates a new key with mecmcp-audit `generate_keypair` and `encode_signing_key`
     - writes it with create-new at mode 0600
     - refuses if the path exists and never truncates
     - prints the public key and `key_id`
-  - `mecfeedmcp snapshot-key public --key-file <path>`: prints the base64 public key on stdout and the `key_id` on stderr. Its stdout is exactly a valid `.pub` file.
+  - `--print-snapshot-signing-public-key`: prints the base64 public key on stdout and the `key_id` on stderr. Its stdout is exactly a valid `.pub` file.
 - **Apply order** (`store::write_snapshot_file`, called from `gate.rs`):
   1. Write `snapshot.json`.
   2. Re-read it and check its digest. This already happens.
-  3. Write `snapshot.sig` with create-new.
+  3. Write `snapshot.sig` with create-new, re-read it and parse it with `parse_signature_file`.
   4. `set_current`.
 
   If step 1, 2 or 3 fails, the version directory is removed and `current` doesn't move. The tool returns an error, and the change set stays approved so a retry works.
@@ -100,7 +101,7 @@ Core gains `ed25519-dalek` (3.0.0) and `base64` (0.23.1). Both are already in `C
 ## 3. mecfeed-serve (verifier)
 
 - **New required, repeatable flag** `--trusted-snapshot-key <path>`.
-  - Each file holds one base64 public key, the output of `snapshot-key public`; surrounding whitespace is trimmed.
+  - Each file holds one base64 public key, the output of `--print-snapshot-signing-public-key`; surrounding whitespace is trimmed.
   - Serve refuses to start when no key is given, when a key is malformed, or when two keys share a `key_id`.
   - Changing trust requires a restart, the same as `--feed-config`.
 - **Verification** happens in `snapshots::load`, after the chain and `current` checks pass:
@@ -116,20 +117,21 @@ Core gains `ed25519-dalek` (3.0.0) and `base64` (0.23.1). Both are already in `C
 ## 4. Packaging and key distribution
 
 - **`packaging/lxc/install.sh` (same host, the packaged default):**
-  - If `/var/lib/mecfeedmcp/snapshot-signing.key` is absent, run `snapshot-key init` as mecfeedmcp with `runuser -u mecfeedmcp --`.
-  - If `/etc/mecfeed-serve/snapshot-signing.pub` is absent, write it from `snapshot-key public` (again run as mecfeedmcp) as mode 0644, owner root.
+  - Create `/etc/mecfeed-serve` (0755 root) when absent.
+  - If `/var/lib/mecfeedmcp/snapshot-signing.key` is absent, run `--init-snapshot-signing-key` as mecfeedmcp with `runuser -u mecfeedmcp --`. A staged install (`MECFEEDMCP_INSTALL_ROOT`) runs it as the invoking user.
+  - If `/etc/mecfeed-serve/snapshot-signing.pub` is absent, write it from `--print-snapshot-signing-public-key` (run the same way) as mode 0644, owner root.
   - On re-runs, keep both files. If the `.pub` doesn't match the key, fail rather than overwrite trust.
-  - The next steps print the `key_id` and say that a serve on another host needs that `.pub` copied to `/etc/mecfeed-serve/` and named by `--trusted-snapshot-key`.
+  - The next steps print the public key and say that a serve on another host needs that `.pub` copied to `/etc/mecfeed-serve/` and named by `--trusted-snapshot-key`.
 - **Units:**
   - `mecfeedmcp.service` gains `--snapshot-signing-key-file /var/lib/mecfeedmcp/snapshot-signing.key`.
   - `mecfeed-serve.service` gains `--trusted-snapshot-key /etc/mecfeed-serve/snapshot-signing.pub`. Serve's existing `ReadOnlyPaths=/etc/mecfeed-serve` covers the file.
   - The expected `ExecStart` in `install.sh` and in `scripts/verify-packaging.sh` changes with them.
 - **`packaging/tests/package-smoke.sh`** checks the key is 0600 mecfeedmcp and the `.pub` is 0644 root, and that the two match.
 - **Docker:**
-  - `Dockerfile` ENTRYPOINT gains the signing-key flag. The key lives in the existing `/var/lib/mecfeedmcp` volume and is created with `docker run … snapshot-key init`.
+  - `Dockerfile` ENTRYPOINT gains the signing-key flag. The key lives in the existing `/var/lib/mecfeedmcp` volume and is created with `docker run … mecfeedmcp --init-snapshot-signing-key`.
   - `Dockerfile.serve` ENTRYPOINT gains `--trusted-snapshot-key /etc/mecfeed-serve/snapshot-signing.pub`, mounted by the operator.
   - `server.json` documents the key in the existing volume; no new volume is added.
-  - The CI container test runs `snapshot-key init` and `public` before starting the pair.
+  - The CI container test runs `--init-snapshot-signing-key` and `--print-snapshot-signing-public-key` and checks the outputs.
 - **Upgrade (`docs/operations.md`):**
   1. Stop both services.
   2. Re-run the installer with `MECFEEDMCP_FORCE_UNIT=1` so both units get the new flags.
@@ -147,7 +149,7 @@ Core gains `ed25519-dalek` (3.0.0) and `base64` (0.23.1). Both are already in `C
 |---|---|---|
 | MCP startup | key missing, wrong mode/owner, malformed | refuse to start; message names the path |
 | MCP apply | sign or `.sig` write fails | version dir removed, `current` unchanged, tool error, change set still approved |
-| `snapshot-key init` | path exists | refuse; file untouched |
+| `--init-snapshot-signing-key` | path exists | refuse; file untouched |
 | serve startup | no trusted key, malformed key, duplicate `key_id` | refuse to start |
 | serve load | `.sig` missing / malformed / unknown key / bad signature | 503 (same body as other load failures); log names the reason |
 
@@ -172,8 +174,9 @@ Core gains `ed25519-dalek` (3.0.0) and `base64` (0.23.1). Both are already in `C
   - a corrupt `.sig` on a historical version still gives 200
   - with two trusted keys, a signature from either one gives 200
 - **CLI:**
-  - `init` then `public` round-trips, and `public`'s output is accepted by `--trusted-snapshot-key`
-  - `init` on an existing path fails and leaves the file byte-identical
+  - init then print round-trips, and the printed key parses with `PublicKey::from_base64`
+  - init on an existing path fails and leaves the file byte-identical
+  - the store refuses a `.sig` that does not parse on re-read and removes the version directory
 - **Packaging:** the `verify-packaging.sh` checks, `package-smoke.sh` and the CI container test.
 - **Live check on LXC 605** (`test-mecfeedmcp`, disposable):
   1. Upgrade it and confirm serve returns 503.
