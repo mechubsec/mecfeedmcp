@@ -44,6 +44,18 @@ struct ServerCli {
     #[arg(long)]
     snapshot_signing_key_file: Option<PathBuf>,
 
+    /// Create a new key at --snapshot-signing-key-file, print its public key, then exit.
+    #[arg(
+        long,
+        requires = "snapshot_signing_key_file",
+        conflicts_with = "print_snapshot_signing_public_key"
+    )]
+    init_snapshot_signing_key: bool,
+
+    /// Print the public key of --snapshot-signing-key-file, then exit.
+    #[arg(long, requires = "snapshot_signing_key_file")]
+    print_snapshot_signing_public_key: bool,
+
     /// Validate package configuration and SBOM, then exit.
     #[arg(long)]
     validate_package: Option<PathBuf>,
@@ -389,6 +401,16 @@ fn validate_package(package_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Create (`init`) or load the snapshot signing key and return `(public_base64, key_id)`.
+fn snapshot_key_action(path: &Path, init: bool) -> Result<(String, String)> {
+    if init {
+        return mecfeedmcp::init_key_file(path).map_err(anyhow::Error::from);
+    }
+    let key = mecmcp_audit::signing::load_signing_key(path)
+        .with_context(|| format!("loading {}", path.display()))?;
+    mecfeedmcp::public_key_text(&key).map_err(anyhow::Error::from)
+}
+
 fn validate_startup_credentials(
     config: &Path,
     credentials_env: Option<&Path>,
@@ -453,6 +475,18 @@ async fn main() -> Result<()> {
         });
     }
 
+    let cli = &parsed.cli;
+    if cli.init_snapshot_signing_key || cli.print_snapshot_signing_public_key {
+        let path = cli
+            .snapshot_signing_key_file
+            .as_deref()
+            .context("--snapshot-signing-key-file is required")?;
+        let (public_key, key_id) = snapshot_key_action(path, cli.init_snapshot_signing_key)?;
+        println!("{public_key}");
+        eprintln!("snapshot signing key id: {key_id}");
+        return Ok(());
+    }
+
     let ServerCli {
         shared: args,
         lab_mode,
@@ -460,6 +494,8 @@ async fn main() -> Result<()> {
         approval_timeout_secs: cli_approval_timeout_secs,
         snapshot_signing_key_file,
         validate_package: _,
+        init_snapshot_signing_key: _,
+        print_snapshot_signing_public_key: _,
         enable_metrics,
         max_requests_per_second_per_ip,
         max_request_burst_per_ip,
@@ -697,9 +733,47 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthMode, resolve_auth_mode, resolve_listener_auth_mode};
+    use super::{
+        AuthMode, ServerCli, resolve_auth_mode, resolve_listener_auth_mode, snapshot_key_action,
+    };
     use mecmcp_runtime::cli::Transport;
     use std::path::Path;
+
+    #[test]
+    fn key_flags_need_the_key_file_and_exclude_each_other() {
+        use clap::Parser as _;
+        assert!(ServerCli::try_parse_from(["mecfeedmcp", "--init-snapshot-signing-key"]).is_err());
+        assert!(
+            ServerCli::try_parse_from([
+                "mecfeedmcp",
+                "--snapshot-signing-key-file",
+                "/tmp/k",
+                "--init-snapshot-signing-key",
+                "--print-snapshot-signing-public-key",
+            ])
+            .is_err()
+        );
+        let parsed = ServerCli::try_parse_from([
+            "mecfeedmcp",
+            "--snapshot-signing-key-file",
+            "/tmp/k",
+            "--print-snapshot-signing-public-key",
+        ])
+        .expect("parse");
+        assert!(parsed.print_snapshot_signing_public_key);
+    }
+
+    #[test]
+    fn init_then_print_agree_and_init_never_overwrites() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("snapshot-signing.key");
+        let created = snapshot_key_action(&path, true).expect("init");
+        assert_eq!(snapshot_key_action(&path, false).expect("print"), created);
+        mecfeedmcp_core::PublicKey::from_base64(&created.0).expect("printed key parses");
+        let before = std::fs::read(&path).expect("read");
+        assert!(snapshot_key_action(&path, true).is_err());
+        assert_eq!(std::fs::read(&path).expect("read"), before);
+    }
 
     #[test]
     fn stdio_never_consults_the_tokens_file() {
