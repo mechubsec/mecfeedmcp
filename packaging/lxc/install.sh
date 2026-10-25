@@ -414,21 +414,39 @@ reject_unsafe_file "$signing_pub_tmp"
 chmod 0644 "$signing_pub_tmp"
 mv -fT -- "$signing_pub_tmp" "$signing_pub_path"
 
+# systemd runs the last ExecStart= across the unit and its drop-ins (read in
+# name order), so a drop-in can add a required flag or take it away.
+# shortcut: reads only the /etc drop-ins this installer manages, not /run
+# (systemctl edit --runtime, gone at reboot) or vendor ones; query
+# `systemctl show -P ExecStart` instead if those ever matter.
+warn_if_exec_start_lacks() {
+    local unit=$1 flag=$2 dropins
+    shopt -s nullglob
+    dropins=("$unit.d"/*.conf)
+    shopt -u nullglob
+    awk '
+        FNR == 1 { joined = "" }
+        /^[[:space:]]*[#;]/ { next }
+        /\\$/ { joined = joined substr($0, 1, length($0) - 1); next }
+        { joined = joined $0; if (joined ~ /^[[:space:]]*ExecStart[[:space:]]*=/) last = joined; joined = "" }
+        END { print last }
+    ' "$unit" "${dropins[@]}" | grep -Fq -- "$flag" \
+        || printf '%s\n' "warning: the ExecStart from $unit and its drop-ins lacks $flag, so the service will not start; re-run with MECFEEDMCP_FORCE_UNIT=1 or fix the unit and its drop-ins" >&2
+}
+
 if [[ -e "$unit_path" ]] && ! cmp -s "$unit_path" "$package_dir/packaging/systemd/mecfeedmcp.service" && [[ "$force_unit" != 1 ]]; then
     printf '%s\n' "preserving customized unit: $unit_path"
-    grep -Fq -- '--snapshot-signing-key-file' "$unit_path" \
-        || printf '%s\n' "warning: $unit_path lacks --snapshot-signing-key-file, so mecfeedmcp will not start; re-run with MECFEEDMCP_FORCE_UNIT=1 or add the flag" >&2
 else
     install -m 0644 "$package_dir/packaging/systemd/mecfeedmcp.service" "$unit_path"
 fi
+warn_if_exec_start_lacks "$unit_path" --snapshot-signing-key-file
 serve_unit_path=$(target_path /etc/systemd/system/mecfeed-serve.service)
 if [[ -e "$serve_unit_path" ]] && ! cmp -s "$serve_unit_path" "$package_dir/packaging/systemd/mecfeed-serve.service" && [[ "$force_unit" != 1 ]]; then
     printf '%s\n' "preserving customized unit: $serve_unit_path"
-    grep -Fq -- '--trusted-snapshot-key' "$serve_unit_path" \
-        || printf '%s\n' "warning: $serve_unit_path lacks --trusted-snapshot-key, so mecfeed-serve will not start; re-run with MECFEEDMCP_FORCE_UNIT=1 or add the flag" >&2
 else
     install -m 0644 "$package_dir/packaging/systemd/mecfeed-serve.service" "$serve_unit_path"
 fi
+warn_if_exec_start_lacks "$serve_unit_path" --trusted-snapshot-key
 if (( live_install )) && [[ "$skip_reload" != 1 ]]; then
     systemctl daemon-reload
 fi
