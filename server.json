@@ -56,6 +56,19 @@
               "isRequired": true
             }
           }
+        },
+        {
+          "type": "named",
+          "name": "-v",
+          "value": "{snapshot_dir}:/var/lib/mecfeed-snapshots",
+          "isRequired": true,
+          "variables": {
+            "snapshot_dir": {
+              "description": "Absolute host directory for published snapshots; mount the same directory into mecfeed-serve. Must be writable by UID 65532.",
+              "format": "filepath",
+              "isRequired": true
+            }
+          }
         }
       ],
       "packageArguments": [

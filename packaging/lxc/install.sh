@@ -173,7 +173,7 @@ validate_service() {
     [[ "$exec_start" == "$expected" ]] || die 'unit ExecStart does not match the package policy'
     require_service_directive EnvironmentFile /etc/mecfeedmcp/credentials.env
     require_service_directive ReadOnlyPaths /etc/mecfeedmcp
-    require_service_directive ReadWritePaths /var/lib/mecfeedmcp
+    require_service_directive ReadWritePaths '/var/lib/mecfeedmcp /var/lib/mecfeed-snapshots'
 }
 
 validate_package() {
@@ -185,6 +185,7 @@ validate_package() {
     grep -Fqx 'u mecfeedmcp - "mecfeedmcp service" /var/lib/mecfeedmcp /usr/sbin/nologin' "$package_dir/packaging/systemd/mecfeedmcp.sysusers" || die 'sysusers declaration is invalid'
     grep -Fqx 'd /etc/mecfeedmcp 0750 root mecfeedmcp -' "$package_dir/packaging/systemd/mecfeedmcp.tmpfiles" || die 'config tmpfiles declaration is invalid'
     grep -Fqx 'd /var/lib/mecfeedmcp 0700 mecfeedmcp mecfeedmcp -' "$package_dir/packaging/systemd/mecfeedmcp.tmpfiles" || die 'state tmpfiles declaration is invalid'
+    grep -Fqx 'd /var/lib/mecfeed-snapshots 2750 mecfeedmcp mecfeed-serve -' "$package_dir/packaging/systemd/mecfeedmcp.tmpfiles" || die 'snapshot tmpfiles declaration is invalid'
 }
 
 # Structural and provenance checks deliberately run before apt, sysusers,
@@ -196,6 +197,7 @@ live_install=0
 
 config_dir=$(target_path /etc/mecfeedmcp)
 state_dir=$(target_path /var/lib/mecfeedmcp)
+snapshot_dir=$(target_path /var/lib/mecfeed-snapshots)
 bin_path=$(target_path /usr/local/bin/mecfeedmcp)
 sysusers_path=$(target_path /usr/lib/sysusers.d/mecfeedmcp.conf)
 tmpfiles_path=$(target_path /usr/lib/tmpfiles.d/mecfeedmcp.conf)
@@ -233,8 +235,10 @@ reject_unsafe_parent_dirs() {
 # Validate destination objects before apt, sysusers, tmpfiles, or any write.
 reject_unsafe_directory "$config_dir"
 reject_unsafe_directory "$state_dir"
+reject_unsafe_directory "$snapshot_dir"
 reject_unsafe_parent_dirs "$config_dir/.parent-validation"
 reject_unsafe_parent_dirs "$state_dir/.parent-validation"
+reject_unsafe_parent_dirs "$snapshot_dir/.parent-validation"
 managed_destinations=(
     "$bin_path" "$config_dir/feed.json.example" "$sysusers_path" "$tmpfiles_path"
     "$unit_path" "$tokens_path" "$hmac_path"
@@ -276,6 +280,7 @@ fi
 
 install -d -m 0750 "$config_dir"
 install -d -m 0700 "$state_dir"
+install -d -m 2750 "$snapshot_dir"
 install -d -m 0755 "$(dirname -- "$bin_path")" "$(dirname -- "$sysusers_path")" \
     "$(dirname -- "$tmpfiles_path")" "$(dirname -- "$unit_path")"
 install -m 0755 "$package_dir/bin/mecfeedmcp" "$bin_path"

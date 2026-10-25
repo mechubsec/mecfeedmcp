@@ -16,9 +16,8 @@ The shared `mecmcp` crates are pinned — to `v0.28.1`.
 | `/var/lib/mecfeedmcp/tokens.json` | bearer-token store |
 | `/var/lib/mecfeedmcp/audit-hmac.key` | audit HMAC key (generated on first run) |
 | `/var/lib/mecfeedmcp/changeset-state.json` | change-set state |
-| `/var/lib/mecfeedmcp/snapshots` | snapshots written by the MCP server |
+| `/var/lib/mecfeed-snapshots` | snapshots: written by the MCP server, read by mecfeed-serve (mecfeedmcp:mecfeed-serve, setgid 2750) |
 | `/etc/mecfeed-serve/tls.crt`, `tls.key` | feed-server TLS material |
-| `/var/lib/mecfeed-serve/snapshots` | feed-server snapshot directory (served read-only at `/feeds/{format}/{kind}`) |
 
 The installer never enables either unit. Create config and credentials first,
 then `systemctl enable --now mecfeedmcp.service` (and `mecfeed-serve.service`
@@ -32,6 +31,7 @@ The MCP image's `ENTRYPOINT` keeps `--device-mapping`, `--tokens-file`, and
 `--audit-hmac-key-file` so an operator `--host` override cannot drop them.
 `--audit-format json` is the correct audit sink in a container (there is no
 journald socket).
+Mount one host directory at `/var/lib/mecfeed-snapshots` in both containers: writable by uid 65532 for the MCP server, `:ro` for `mecfeed-serve`.
 
 `mecfeed-serve` matches its client allowlist against the TCP peer address.
 Behind Docker NAT that address is the bridge gateway, so the default
@@ -49,8 +49,24 @@ the operator allowlists at startup and applies them to the current snapshot on
 every render, so restart it after editing `feed.json`. Older versions are
 verified without them. An allowlist entry that conflicts with the current
 version makes it answer 503 until a new version is published without that
-entry. The packaged layout does not yet share the snapshot directory or
-grant serve read access to `feed.json`; that wiring is a later change.
+entry. The packaged serve unit reads `feed.json` through
+`LoadCredential`, so the file stays `0640 root:mecfeedmcp`; the MCP unit runs with
+`UMask=0027` so new snapshots are group-readable by `mecfeed-serve`. Installs from
+before this change kept snapshots in `/var/lib/mecfeedmcp/snapshots`. To upgrade, stop
+both services first so no publish lands in the old tree. Re-run the installer with
+`MECFEEDMCP_FORCE_UNIT=1`: both unit files changed, and it otherwise keeps a changed
+unit as customized. The installer creates `/var/lib/mecfeed-snapshots`, so move the
+old tree's contents into it rather than the tree itself:
+
+```sh
+mv /var/lib/mecfeedmcp/snapshots/current /var/lib/mecfeedmcp/snapshots/versions /var/lib/mecfeed-snapshots/
+chown -R mecfeedmcp:mecfeed-serve /var/lib/mecfeed-snapshots
+find /var/lib/mecfeed-snapshots -type d -exec chmod 2750 {} +
+find /var/lib/mecfeed-snapshots -type f -exec chmod 0640 {} +
+```
+
+Then set `snapshot_dir` to `/var/lib/mecfeed-snapshots` in `feed.json` and start both
+services.
 
 ## Tokens and audit
 

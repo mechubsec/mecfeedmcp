@@ -67,11 +67,12 @@ jobs:
           docker rm "$container_id" > /dev/null
           echo "$argv" | grep -q -- '/etc/mecfeed-serve/tls.crt' || { echo "FAIL: --tls-cert missing from argv"; exit 1; }
           echo "$argv" | grep -q -- '/etc/mecfeed-serve/tls.key' || { echo "FAIL: --tls-key missing from argv"; exit 1; }
-          echo "$argv" | grep -q -- '/var/lib/mecfeed-serve/snapshots' || { echo "FAIL: --snapshot-dir missing from argv"; exit 1; }
+          echo "$argv" | grep -q -- '/var/lib/mecfeed-snapshots' || { echo "FAIL: --snapshot-dir missing from argv"; exit 1; }
           echo "PASS: feed-server TLS paths survive --listen override"
       - name: Verify the audit HMAC key is generated on first run
         run: |
           state_dir=$(mktemp -d)
+          snapshot_dir=$(mktemp -d)
           etc_dir=$(mktemp -d)
           cp examples/feed.example.json "$etc_dir/feed.json"
           echo '{"version":1,"tokens":[]}' > "$state_dir/tokens.json"
@@ -79,10 +80,12 @@ jobs:
           chmod 0600 "$state_dir/tokens.json"
           chmod 0750 "$etc_dir"
           chmod 0700 "$state_dir"
-          sudo chown -R 65532:65532 "$state_dir" "$etc_dir"
+          chmod 0750 "$snapshot_dir"
+          sudo chown -R 65532:65532 "$state_dir" "$snapshot_dir" "$etc_dir"
           docker run --rm \
             -v "$etc_dir:/etc/mecfeedmcp:ro" \
             -v "$state_dir:/var/lib/mecfeedmcp" \
+            -v "$snapshot_dir:/var/lib/mecfeed-snapshots" \
             --user 65532:65532 \
             mecfeedmcp:ci --transport stdio --allow-no-auth || true
           sudo test -s "$state_dir/audit-hmac.key" || { echo "FAIL: audit-hmac.key was not generated"; exit 1; }
