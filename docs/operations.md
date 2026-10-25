@@ -108,7 +108,15 @@ mecfeed-serve`) that sets an empty `ExecStart=` and then the full new
 1. As root, create a new key at a new path and install its public key under
    `/etc/mecfeed-serve` as `root:root` mode `0644`, so serve can read it and no
    unprivileged account can change it:
-   `runuser -u mecfeedmcp -- mecfeedmcp --snapshot-signing-key-file /var/lib/mecfeedmcp/<new-name>.key --init-snapshot-signing-key | install -o root -g root -m 0644 /dev/stdin /etc/mecfeed-serve/<new-name>.pub`
+
+   ```sh
+   pub=$(runuser -u mecfeedmcp -- mecfeedmcp --snapshot-signing-key-file /var/lib/mecfeedmcp/<new-name>.key --init-snapshot-signing-key) \
+     && printf '%s\n' "$pub" | install -o root -g root -m 0644 /dev/stdin /etc/mecfeed-serve/<new-name>.pub
+   ```
+
+   A failed init installs nothing. If the new key already exists (a retry), use
+   `--print-snapshot-signing-public-key` in place of `--init-snapshot-signing-key`
+   in the same command.
 2. Copy serve's current `ExecStart` (from `systemctl cat mecfeed-serve`) into
    the drop-in and add only `--trusted-snapshot-key /etc/mecfeed-serve/<new-name>.pub`,
    then `systemctl daemon-reload` and restart serve.
