@@ -225,6 +225,15 @@ reject_unsafe_file() {
     fi
 }
 
+# Nobody else may swap files in a directory between a check and root's use of them.
+require_root_only_dir() {
+    local dir=$1
+    (( 8#$(stat -c %a -- "$dir") & 8#022 )) && die "$dir is writable by group or other"
+    if (( live_install )); then
+        [[ $(stat -c %u -- "$dir") == 0 ]] || die "$dir is not owned by root"
+    fi
+}
+
 reject_unsafe_parent_dirs() {
     local path=$1 parent
     parent=$(dirname -- "$path")
@@ -311,6 +320,7 @@ fi
 #
 # Re-validate immediately before use rather than trusting the earlier
 # managed_destinations check, which ran before apt/sysusers/tmpfiles.
+require_root_only_dir "$config_dir"
 reject_unsafe_file "$tokens_path"
 reject_unsafe_file "$hmac_path"
 if [[ ! -e "$tokens_path" ]]; then
@@ -383,12 +393,7 @@ if [[ -L "$serve_config_dir" ]] || { [[ -e "$serve_config_dir" ]] && [[ ! -d "$s
     die "unsafe directory: $serve_config_dir"
 fi
 [[ -d "$serve_config_dir" ]] || install -d -m 0755 "$serve_config_dir"
-# Nobody else may swap files in this directory between a check and its use.
-(( 8#$(stat -c %a -- "$serve_config_dir") & 8#022 )) \
-    && die "$serve_config_dir is writable by group or other"
-if (( live_install )); then
-    [[ $(stat -c %u -- "$serve_config_dir") == 0 ]] || die "$serve_config_dir is not owned by root"
-fi
+require_root_only_dir "$serve_config_dir"
 reject_unsafe_file "$signing_key_path"
 reject_unsafe_file "$signing_pub_path"
 if [[ ! -e "$signing_key_path" ]]; then
@@ -397,7 +402,7 @@ if [[ ! -e "$signing_key_path" ]]; then
         || die 'cannot create the snapshot signing key'
 fi
 signing_public_key=$(run_as_service_user "$bin_path" --snapshot-signing-key-file "$signing_key_path" \
-    --print-snapshot-signing-public-key 2>/dev/null) \
+    --print-snapshot-signing-public-key) \
     || die 'cannot read the snapshot signing key'
 if [[ -e "$signing_pub_path" ]]; then
     # Trim only the ends, as mecfeed-serve does: inner whitespace must not compare equal.

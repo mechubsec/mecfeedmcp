@@ -237,6 +237,7 @@ stage_install() {
 }
 stage_install >/dev/null 2>"$work_dir/stale-unit.err"
 grep -Fq -- 'lacks --snapshot-signing-key-file' "$work_dir/stale-unit.err"
+grep -Fq 'snapshot signing key id:' "$work_dir/stale-unit.err"
 stage_key="$stage_root/var/lib/mecfeedmcp/snapshot-signing.key"
 stage_pub="$stage_root/etc/mecfeed-serve/snapshot-signing.pub"
 [[ -f "$stage_key" && -f "$stage_pub" ]] || exit 1
@@ -304,6 +305,22 @@ if MECFEEDMCP_INSTALL_ROOT="$open_dir_root" \
 fi
 grep -Fq 'is writable by group or other' "$work_dir/open-dir.err"
 [[ ! -e "$open_dir_root/etc/mecfeed-serve/snapshot-signing.pub" ]] || exit 1
+
+# A malformed signing key fails the install and the binary's own error is shown.
+bad_key_root="$work_dir/bad-key-root"
+mkdir -p "$bad_key_root/var/lib/mecfeedmcp"
+printf '%s\n' 'not a signing key' >"$bad_key_root/var/lib/mecfeedmcp/snapshot-signing.key"
+chmod 0600 "$bad_key_root/var/lib/mecfeedmcp/snapshot-signing.key"
+if MECFEEDMCP_INSTALL_ROOT="$bad_key_root" \
+    MECFEEDMCP_INSTALL_SKIP_USER=1 \
+    MECFEEDMCP_INSTALL_SKIP_SYSTEMD_RELOAD=1 \
+    MECFEEDMCP_INSTALL_SKIP_RUNTIME_DEPS=1 \
+    "$installer" >/dev/null 2>"$work_dir/bad-key.err"; then
+    printf '%s\n' 'installer accepted a malformed signing key' >&2
+    exit 1
+fi
+grep -Fq 'cannot read the snapshot signing key' "$work_dir/bad-key.err"
+grep -Fq 'invalid key encoding' "$work_dir/bad-key.err"
 
 unsafe_root="$work_dir/unsafe-root"
 sentinel_dir="$work_dir/sentinels"
