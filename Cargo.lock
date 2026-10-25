@@ -1410,9 +1410,12 @@ dependencies = [
 name = "mecfeedmcp-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
+ "ed25519-dalek",
  "ipnet",
  "proptest",
  "serde",
+ "serde_json",
  "sha2",
  "thiserror",
 ]

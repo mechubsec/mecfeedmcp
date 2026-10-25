@@ -1,4 +1,4 @@
-//! Indicator admission, snapshot versions, and vendor feed renderers.
+//! Indicator admission, snapshot versions and signatures, and vendor feed renderers.
 //!
 //! Pure logic: no I/O. Source readers, change-set lifecycle, and the feed
 //! HTTP server live in the other workspace crates.
@@ -10,6 +10,7 @@ mod model;
 mod policy;
 mod range;
 mod render;
+mod signature;
 mod two_label_public_suffixes;
 mod version;
 
@@ -22,6 +23,10 @@ pub use range::{
     validate_indicator,
 };
 pub use render::{FeedFormat, RenderError, render_feed};
+pub use signature::{
+    PublicKey, SIGNATURE_FILE_MAX_BYTES, SIGNATURE_FILE_NAME, SignatureError, SignatureFile,
+    TrustedKeys, encode_signature_file, parse_signature_file, signed_message, signing_input,
+};
 pub use version::{
     FeedVersions, Manifest, PlannedSnapshot, Snapshot, SnapshotDocument, SnapshotRow, SweepOutcome,
     VersionError,
