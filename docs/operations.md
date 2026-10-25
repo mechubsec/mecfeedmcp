@@ -137,7 +137,11 @@ Upgrading from an unsigned release (systemd/LXC):
 
 1. `systemctl stop mecfeed-serve mecfeedmcp`
 2. Re-run the installer with `MECFEEDMCP_FORCE_UNIT=1` so both units get the new
-   flags. This also creates the key and the `.pub`.
+   flags. This also creates the key and the `.pub`. `MECFEEDMCP_FORCE_UNIT=1`
+   overwrites hand-edited unit files: drop-ins in
+   `/etc/systemd/system/<unit>.service.d/` survive, direct edits do not. Diff the
+   installed units against `packaging/systemd/` first and move local changes into
+   drop-ins.
 3. `systemctl start mecfeedmcp mecfeed-serve`
 4. Publish one new version (plan, approve, apply).
 

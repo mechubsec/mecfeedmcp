@@ -235,7 +235,8 @@ stage_install() {
     MECFEEDMCP_INSTALL_SKIP_RUNTIME_DEPS=1 \
         "$installer"
 }
-stage_install >/dev/null
+stage_install >/dev/null 2>"$work_dir/stale-unit.err"
+grep -Fq -- 'lacks --snapshot-signing-key-file' "$work_dir/stale-unit.err"
 stage_key="$stage_root/var/lib/mecfeedmcp/snapshot-signing.key"
 stage_pub="$stage_root/etc/mecfeed-serve/snapshot-signing.pub"
 [[ -f "$stage_key" && -f "$stage_pub" ]] || exit 1

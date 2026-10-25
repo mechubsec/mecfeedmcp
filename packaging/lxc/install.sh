@@ -416,12 +416,16 @@ mv -fT -- "$signing_pub_tmp" "$signing_pub_path"
 
 if [[ -e "$unit_path" ]] && ! cmp -s "$unit_path" "$package_dir/packaging/systemd/mecfeedmcp.service" && [[ "$force_unit" != 1 ]]; then
     printf '%s\n' "preserving customized unit: $unit_path"
+    grep -Fq -- '--snapshot-signing-key-file' "$unit_path" \
+        || printf '%s\n' "warning: $unit_path lacks --snapshot-signing-key-file, so mecfeedmcp will not start; re-run with MECFEEDMCP_FORCE_UNIT=1 or add the flag" >&2
 else
     install -m 0644 "$package_dir/packaging/systemd/mecfeedmcp.service" "$unit_path"
 fi
 serve_unit_path=$(target_path /etc/systemd/system/mecfeed-serve.service)
 if [[ -e "$serve_unit_path" ]] && ! cmp -s "$serve_unit_path" "$package_dir/packaging/systemd/mecfeed-serve.service" && [[ "$force_unit" != 1 ]]; then
     printf '%s\n' "preserving customized unit: $serve_unit_path"
+    grep -Fq -- '--trusted-snapshot-key' "$serve_unit_path" \
+        || printf '%s\n' "warning: $serve_unit_path lacks --trusted-snapshot-key, so mecfeed-serve will not start; re-run with MECFEEDMCP_FORCE_UNIT=1 or add the flag" >&2
 else
     install -m 0644 "$package_dir/packaging/systemd/mecfeed-serve.service" "$serve_unit_path"
 fi
