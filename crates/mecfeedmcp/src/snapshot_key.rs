@@ -1,9 +1,9 @@
 //! The snapshot signing key: creating it, its public half, and signing a digest.
 //! The signature format lives in `mecfeedmcp_core`.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions, Permissions};
 use std::io::{ErrorKind, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use mecfeedmcp_core::{PublicKey, SignatureError, encode_signature_file, signing_input};
@@ -55,10 +55,25 @@ pub fn init_key_file(path: &Path) -> Result<(String, String), SnapshotKeyError> 
             ErrorKind::AlreadyExists => SnapshotKeyError::Exists(path.to_path_buf()),
             _ => write_error(error),
         })?;
-    file.write_all(audit_signing::encode_signing_key(&key).as_bytes())
-        .map_err(write_error)?;
-    file.sync_all().map_err(write_error)?;
+    // `create_new` proved this call made the file, so a failed init may remove it.
+    let persisted = persist_key(&mut file, path, &key);
+    if let Err(error) = persisted {
+        let _ = std::fs::remove_file(path);
+        return Err(write_error(error));
+    }
     public_key_text(&key)
+}
+
+/// Write `key` to the freshly created `file` and make it durable, 0600 under any umask.
+fn persist_key(file: &mut File, path: &Path, key: &SigningKey) -> std::io::Result<()> {
+    file.set_permissions(Permissions::from_mode(0o600))?;
+    file.write_all(audit_signing::encode_signing_key(key).as_bytes())?;
+    file.sync_all()?;
+    let parent = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    File::open(parent)?.sync_all()
 }
 
 /// The public half of `key` as `(public_base64, key_id)`. The base64 text is
@@ -120,6 +135,17 @@ mod tests {
             signature_file("sha256:00", &key),
             Err(SnapshotKeyError::Format(SignatureError::InvalidDigest))
         ));
+    }
+
+    #[test]
+    fn init_reports_a_write_error_and_leaves_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing").join("snapshot-signing.key");
+        assert!(matches!(
+            init_key_file(&path),
+            Err(SnapshotKeyError::Write { .. })
+        ));
+        assert!(!path.exists());
     }
 
     #[test]
