@@ -12,7 +12,8 @@ ExecStart=/usr/local/bin/mecfeed-serve \
     --listen 0.0.0.0:8443 \
     --tls-cert /etc/mecfeed-serve/tls.crt \
     --tls-key /etc/mecfeed-serve/tls.key \
-    --snapshot-dir /var/lib/mecfeed-serve/snapshots
+    --snapshot-dir /var/lib/mecfeed-serve/snapshots \
+    --feed-config /etc/mecfeedmcp/feed.json
 Restart=always
 RestartSec=5s
 TimeoutStopSec=30s
@@ -23,7 +24,7 @@ StateDirectoryMode=0700
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadOnlyPaths=/etc/mecfeed-serve
+ReadOnlyPaths=/etc/mecfeed-serve /etc/mecfeedmcp
 ReadWritePaths=/var/lib/mecfeed-serve
 PrivateTmp=true
 PrivateDevices=true

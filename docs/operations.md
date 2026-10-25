@@ -1,8 +1,8 @@
 # Operations
 
 > 🚧 **Under construction.** The MCP server publishes an approved snapshot
-> and can read MISP. `mecfeed-serve` does not serve snapshots yet. Do not
-> point production firewalls at it.
+> and can read MISP. `mecfeed-serve` serves verified snapshots; auth, abuse
+> limits, and the security review are not done. Do not deploy it.
 
 The shared `mecmcp` crates are pinned — to `v0.28.1`.
 
@@ -18,7 +18,7 @@ The shared `mecmcp` crates are pinned — to `v0.28.1`.
 | `/var/lib/mecfeedmcp/changeset-state.json` | change-set state |
 | `/var/lib/mecfeedmcp/snapshots` | snapshots written by the MCP server |
 | `/etc/mecfeed-serve/tls.crt`, `tls.key` | feed-server TLS material |
-| `/var/lib/mecfeed-serve/snapshots` | feed-server snapshot directory (not served yet) |
+| `/var/lib/mecfeed-serve/snapshots` | feed-server snapshot directory (served read-only at `/feeds/{format}/{kind}`) |
 
 The installer never enables either unit. Create config and credentials first,
 then `systemctl enable --now mecfeedmcp.service` (and `mecfeed-serve.service`
@@ -37,6 +37,20 @@ journald socket).
 Behind Docker NAT that address is the bridge gateway, so the default
 loopback-only allowlist rejects every client. Use host networking, or pass
 `--allow-cidr` with the firewall addresses that should pull snapshots.
+
+`mecfeed-serve` serves `GET`/`HEAD /feeds/{format}/{kind}` from the current
+verified snapshot and answers 503 when the snapshot log does not verify.
+Formats: `panos-edl`, `junos-dynamic-address`, `fortigate-threat-feed`,
+`opnsense-url-table`. Kinds: `address`, `prefix`, `domain` (Junos has no
+`domain`). Everything else is 404.
+
+`mecfeed-serve` requires `--feed-config` (the MCP server's `feed.json`). It reads
+the operator allowlists at startup and applies them to the current snapshot on
+every render, so restart it after editing `feed.json`. Older versions are
+verified without them. An allowlist entry that conflicts with the current
+version makes it answer 503 until a new version is published without that
+entry. The packaged layout does not yet share the snapshot directory or
+grant serve read access to `feed.json`; that wiring is a later change.
 
 ## Tokens and audit
 
