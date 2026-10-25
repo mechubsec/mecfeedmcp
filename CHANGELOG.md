@@ -17,3 +17,4 @@
 - `list_indicators` and `search_indicators` read mapped MISP attributes over HTTPS. The API key is a file or environment reference. Operator prefix and domain allowlists load from `feed.json`.
 - `mecfeed-serve` serves the current verified snapshot at `/feeds/{format}/{kind}` with ETag/If-None-Match and fails closed when the log does not verify.
 - The packaged MCP server and mecfeed-serve share /var/lib/mecfeed-snapshots; serve reads feed.json through systemd LoadCredential.
+- The MCP server verifies stored history without the operator allowlists, so a new allowlist entry that matches an old version no longer stops it starting.

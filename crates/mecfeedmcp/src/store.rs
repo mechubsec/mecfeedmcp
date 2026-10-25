@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use mecfeedmcp_core::{FeedVersions, Policy, SnapshotDocument, VersionError};
+use mecfeedmcp_core::{FeedVersions, Limits, Policy, SnapshotDocument, VersionError};
 use thiserror::Error;
 
 /// Why a snapshot directory operation failed.
@@ -115,7 +115,17 @@ fn load_versions(dir: &Path, policy: Policy) -> Result<FeedVersions, StoreError>
         return Err(StoreError::Log);
     }
     let current = current_number(dir)?;
-    let mut versions = FeedVersions::open(policy);
+    // History is verified under the baseline (chain + hard floors) so a new
+    // allowlist entry cannot reject old versions; the operator policy then
+    // applies to new plans and to render.
+    let baseline = Policy::try_new(
+        Vec::new(),
+        Vec::new(),
+        std::iter::empty::<&str>(),
+        Limits::default(),
+    )
+    .map_err(|_| StoreError::Log)?;
+    let mut versions = FeedVersions::open(baseline);
     for number in &numbers {
         let document = read_snapshot(&version_dir(dir, *number)?)?;
         if document.number != *number {
@@ -123,6 +133,7 @@ fn load_versions(dir: &Path, policy: Policy) -> Result<FeedVersions, StoreError>
         }
         versions.import_document(document, 0).map_err(map_version)?;
     }
+    versions.update_policy(policy);
     match (current, numbers.last().copied()) {
         (None, None) => Ok(versions),
         (Some(current), Some(latest)) if current == latest => Ok(versions),

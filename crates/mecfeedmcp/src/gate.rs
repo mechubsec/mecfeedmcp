@@ -920,6 +920,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allowlisting_a_historical_entry_does_not_block_reopen() {
+        let fix = fixture();
+        {
+            let publisher = open(&fix, false);
+            let plan = publisher
+                .plan("alice", one("1.0.0.1"), NOW)
+                .await
+                .expect("plan");
+            publisher
+                .approve("bob", true, &plan.change_set_id, &plan.digest)
+                .await
+                .expect("approve");
+            publisher
+                .apply("alice", &attr(), &plan.change_set_id, &plan.digest, NOW)
+                .await
+                .expect("apply");
+        }
+        let allowlisting = Policy::try_new(
+            Vec::new(),
+            vec!["1.0.0.0/24".parse().expect("cidr")],
+            std::iter::empty::<&str>(),
+            Limits::default(),
+        )
+        .expect("policy");
+        let publisher = FeedPublisher::open(
+            &fix.snapshots,
+            &fix.state,
+            allowlisting,
+            "lab",
+            false,
+            Duration::from_secs(900),
+        )
+        .expect("reopen");
+        assert!(publisher.latest().expect("lock").is_some());
+        publisher
+            .plan("alice", one("1.0.0.2"), NOW)
+            .await
+            .expect_err("operator allowlist still applies to new plans");
+    }
+
+    #[tokio::test]
     async fn apply_without_approval_writes_nothing() {
         let fix = fixture();
         let publisher = open(&fix, false);
