@@ -622,6 +622,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_recorded_broad_exception_in_history_does_not_block_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old = now() - 10 * DAY;
+        let at = now();
+        let permitting = Limits {
+            permit_explicit_broad: true,
+            ..Limits::default()
+        };
+        let mut versions = FeedVersions::open(
+            Policy::try_new(vec![], vec![], Vec::<&str>::new(), permitting).expect("policy"),
+        );
+        publish(
+            &mut versions,
+            old,
+            vec![ProposedEntry {
+                allow_broad_prefix: true,
+                ..entry(IndicatorKind::Cidr, "1.0.0.0/16", old, old + DAY)
+            }],
+        );
+        publish(
+            &mut versions,
+            at,
+            vec![entry(IndicatorKind::Ip, "1.0.0.2", at, at + DAY)],
+        );
+        write_layout(dir.path(), &versions, 2, 2);
+        let (status, _, body) = send(
+            &app(dir.path()),
+            Method::GET,
+            "/feeds/panos-edl/address",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"1.0.0.2\n");
+    }
+
+    #[tokio::test]
     async fn allowlist_covers_unmatched_routes() {
         let dir = one_version_dir();
         let outsider = app_for_peer(dir.path(), [8, 8, 8, 8]);

@@ -117,12 +117,16 @@ fn load_versions(dir: &Path, policy: Policy) -> Result<FeedVersions, StoreError>
     let current = current_number(dir)?;
     // History is verified under the baseline (chain + hard floors) so a new
     // allowlist entry cannot reject old versions; the operator policy then
-    // applies to new plans and to render.
+    // applies to new plans and to render. A recorded broad exception stays
+    // valid; the hard prefix floors still apply.
     let baseline = Policy::try_new(
         Vec::new(),
         Vec::new(),
         std::iter::empty::<&str>(),
-        Limits::default(),
+        Limits {
+            permit_explicit_broad: true,
+            ..Limits::default()
+        },
     )
     .map_err(|_| StoreError::Log)?;
     let mut versions = FeedVersions::open(baseline);
