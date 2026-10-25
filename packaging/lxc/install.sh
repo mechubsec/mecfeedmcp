@@ -383,6 +383,12 @@ if [[ -L "$serve_config_dir" ]] || { [[ -e "$serve_config_dir" ]] && [[ ! -d "$s
     die "unsafe directory: $serve_config_dir"
 fi
 [[ -d "$serve_config_dir" ]] || install -d -m 0755 "$serve_config_dir"
+# Nobody else may swap files in this directory between a check and its use.
+(( 8#$(stat -c %a -- "$serve_config_dir") & 8#022 )) \
+    && die "$serve_config_dir is writable by group or other"
+if (( live_install )); then
+    [[ $(stat -c %u -- "$serve_config_dir") == 0 ]] || die "$serve_config_dir is not owned by root"
+fi
 reject_unsafe_file "$signing_key_path"
 reject_unsafe_file "$signing_pub_path"
 if [[ ! -e "$signing_key_path" ]]; then
@@ -400,19 +406,13 @@ if [[ -e "$signing_pub_path" ]]; then
     existing_public_key="${existing_public_key%"${existing_public_key##*[![:space:]]}"}"
     [[ "$existing_public_key" == "$signing_public_key" ]] \
         || die "$signing_pub_path does not match the snapshot signing key; fix trust by hand"
-    reject_unsafe_file "$signing_pub_path"
-    chmod 0644 "$signing_pub_path"
-    if (( live_install )); then
-        reject_unsafe_file "$signing_pub_path"
-        chown -h root:root "$signing_pub_path"
-    fi
-else
-    signing_pub_tmp=$(mktemp "$serve_config_dir/.snapshot-signing.pub.XXXXXX")
-    printf '%s\n' "$signing_public_key" >"$signing_pub_tmp"
-    reject_unsafe_file "$signing_pub_tmp"
-    chmod 0644 "$signing_pub_tmp"
-    mv -fT -- "$signing_pub_tmp" "$signing_pub_path"
 fi
+# Always replace (never mutate in place); the directory is root-only, so the temp file cannot be swapped.
+signing_pub_tmp=$(mktemp "$serve_config_dir/.snapshot-signing.pub.XXXXXX")
+printf '%s\n' "$signing_public_key" >"$signing_pub_tmp"
+reject_unsafe_file "$signing_pub_tmp"
+chmod 0644 "$signing_pub_tmp"
+mv -fT -- "$signing_pub_tmp" "$signing_pub_path"
 
 if [[ -e "$unit_path" ]] && ! cmp -s "$unit_path" "$package_dir/packaging/systemd/mecfeedmcp.service" && [[ "$force_unit" != 1 ]]; then
     printf '%s\n' "preserving customized unit: $unit_path"

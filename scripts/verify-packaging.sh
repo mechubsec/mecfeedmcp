@@ -238,8 +238,6 @@ assert_installer_reguards_before_mutation() {
     local -a guard_pairs=(
         'reject_unsafe_file "$hmac_path"|chmod 0600 "$hmac_path"'
         'reject_unsafe_file "$tokens_path"|chmod 0600 "$tokens_path"'
-        'reject_unsafe_file "$signing_pub_path"|chmod 0644 "$signing_pub_path"'
-        'reject_unsafe_file "$signing_pub_path"|chown -h root:root "$signing_pub_path"'
         'reject_unsafe_file "$signing_pub_tmp"|chmod 0644 "$signing_pub_tmp"'
         'reject_unsafe_file "$hmac_path"|chown mecfeedmcp:mecfeedmcp "$hmac_path"'
         'reject_unsafe_file "$tokens_path"|chown -h mecfeedmcp:mecfeedmcp "$tokens_path"'

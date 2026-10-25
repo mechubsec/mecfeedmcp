@@ -268,6 +268,21 @@ fi
 grep -Fq 'does not match' "$work_dir/mismatch.err"
 grep -F "$stage_key" "$work_dir/signing.sha256" | sha256sum -c - >/dev/null
 
+# A group/world-writable /etc/mecfeed-serve is refused before any .pub is written.
+open_dir_root="$work_dir/open-dir-root"
+mkdir -p "$open_dir_root/etc/mecfeed-serve"
+chmod 0777 "$open_dir_root/etc/mecfeed-serve"
+if MECFEEDMCP_INSTALL_ROOT="$open_dir_root" \
+    MECFEEDMCP_INSTALL_SKIP_USER=1 \
+    MECFEEDMCP_INSTALL_SKIP_SYSTEMD_RELOAD=1 \
+    MECFEEDMCP_INSTALL_SKIP_RUNTIME_DEPS=1 \
+    "$installer" >/dev/null 2>"$work_dir/open-dir.err"; then
+    printf '%s\n' 'installer accepted a writable signing public key directory' >&2
+    exit 1
+fi
+grep -Fq 'is writable by group or other' "$work_dir/open-dir.err"
+[[ ! -e "$open_dir_root/etc/mecfeed-serve/snapshot-signing.pub" ]] || exit 1
+
 unsafe_root="$work_dir/unsafe-root"
 sentinel_dir="$work_dir/sentinels"
 mkdir -p "$unsafe_root/etc/mecfeedmcp" "$unsafe_root/var/lib/mecfeedmcp" "$sentinel_dir"
