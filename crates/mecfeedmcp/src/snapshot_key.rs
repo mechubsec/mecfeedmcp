@@ -46,29 +46,46 @@ pub fn init_key_file(path: &Path) -> Result<(String, String), SnapshotKeyError> 
         path: path.to_path_buf(),
         error,
     };
+    if path.symlink_metadata().is_ok() {
+        return Err(SnapshotKeyError::Exists(path.to_path_buf()));
+    }
+    let Some(file_name) = path.file_name() else {
+        return Err(write_error(ErrorKind::InvalidInput.into()));
+    };
+    // A crash leaves at most a stray `.partial` file; the pid in its name keeps it from blocking a later init.
+    let mut temp_name = std::ffi::OsString::from(".");
+    temp_name.push(file_name);
+    temp_name.push(format!(".{}.partial", std::process::id()));
+    let temp_path = path.with_file_name(temp_name);
+
+    let staged = stage_key(&temp_path, &key);
+    let linked = staged.and_then(|()| std::fs::hard_link(&temp_path, path));
+    let _ = std::fs::remove_file(&temp_path);
+    if let Err(error) = linked {
+        return Err(match error.kind() {
+            ErrorKind::AlreadyExists => SnapshotKeyError::Exists(path.to_path_buf()),
+            _ => write_error(error),
+        });
+    }
+    // On failure here the key is complete at `path`, so it stays; only durability is unconfirmed.
+    sync_parent(path).map_err(write_error)?;
+    public_key_text(&key)
+}
+
+/// Write `key` to a new 0600 file at `temp_path` (umask-proof) and sync it.
+fn stage_key(temp_path: &Path, key: &SigningKey) -> std::io::Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)
-        .map_err(|error| match error.kind() {
-            ErrorKind::AlreadyExists => SnapshotKeyError::Exists(path.to_path_buf()),
-            _ => write_error(error),
-        })?;
-    // `create_new` proved this call made the file, so a failed init may remove it.
-    let persisted = persist_key(&mut file, path, &key);
-    if let Err(error) = persisted {
-        let _ = std::fs::remove_file(path);
-        return Err(write_error(error));
-    }
-    public_key_text(&key)
-}
-
-/// Write `key` to the freshly created `file` and make it durable, 0600 under any umask.
-fn persist_key(file: &mut File, path: &Path, key: &SigningKey) -> std::io::Result<()> {
+        .open(temp_path)?;
     file.set_permissions(Permissions::from_mode(0o600))?;
     file.write_all(audit_signing::encode_signing_key(key).as_bytes())?;
-    file.sync_all()?;
+    file.sync_all()
+}
+
+/// Sync the directory holding `path`, using `.` for a bare filename.
+fn sync_parent(path: &Path) -> std::io::Result<()> {
     let parent = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
@@ -146,6 +163,25 @@ mod tests {
             Err(SnapshotKeyError::Write { .. })
         ));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn init_ignores_a_stale_partial_file_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stale = dir.path().join(".snapshot-signing.key.1.partial");
+        fs::write(&stale, b"junk").expect("stale");
+        let path = dir.path().join("snapshot-signing.key");
+        init_key_file(&path).expect("init");
+        audit_signing::load_signing_key(&path).expect("load");
+        let mut names: Vec<_> = fs::read_dir(dir.path())
+            .expect("read_dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [".snapshot-signing.key.1.partial", "snapshot-signing.key"]
+        );
     }
 
     #[test]
