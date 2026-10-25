@@ -245,12 +245,27 @@ stage_install >/dev/null
 sha256sum -c "$work_dir/preserved.sha256" >/dev/null
 sha256sum -c "$work_dir/signing.sha256" >/dev/null
 
-# A .pub that no longer matches the key must stop the installer, key untouched.
+# A retained matching .pub is normalized to 0644 (staged mode cannot chown).
+chmod 0600 "$stage_pub"
+stage_install >/dev/null
+[[ $(stat -c %a "$stage_pub") == 644 ]] || exit 1
+
+# A .pub that does not match the key, or that has inner whitespace serve would
+# refuse, must stop the installer for that reason, key untouched.
+matching_pub=$(<"$stage_pub")
+printf '%s\n' "${matching_pub:0:8} ${matching_pub:8}" >"$stage_pub"
+if stage_install >/dev/null 2>"$work_dir/inner-space.err"; then
+    printf '%s\n' 'installer accepted a signing .pub with inner whitespace' >&2
+    exit 1
+fi
+grep -Fq 'does not match' "$work_dir/inner-space.err"
+grep -F "$stage_key" "$work_dir/signing.sha256" | sha256sum -c - >/dev/null
 cp -- "$fresh_pub" "$stage_pub"
-if stage_install >/dev/null 2>&1; then
+if stage_install >/dev/null 2>"$work_dir/mismatch.err"; then
     printf '%s\n' 'installer accepted a signing .pub that does not match the key' >&2
     exit 1
 fi
+grep -Fq 'does not match' "$work_dir/mismatch.err"
 grep -F "$stage_key" "$work_dir/signing.sha256" | sha256sum -c - >/dev/null
 
 unsafe_root="$work_dir/unsafe-root"

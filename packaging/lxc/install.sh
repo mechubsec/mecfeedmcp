@@ -394,8 +394,16 @@ signing_public_key=$(run_as_service_user "$bin_path" --snapshot-signing-key-file
     --print-snapshot-signing-public-key 2>/dev/null) \
     || die 'cannot read the snapshot signing key'
 if [[ -e "$signing_pub_path" ]]; then
-    [[ $(tr -d '[:space:]' <"$signing_pub_path") == "$signing_public_key" ]] \
+    # Trim only the ends, as mecfeed-serve does: inner whitespace must not compare equal.
+    existing_public_key=$(<"$signing_pub_path")
+    existing_public_key="${existing_public_key#"${existing_public_key%%[![:space:]]*}"}"
+    existing_public_key="${existing_public_key%"${existing_public_key##*[![:space:]]}"}"
+    [[ "$existing_public_key" == "$signing_public_key" ]] \
         || die "$signing_pub_path does not match the snapshot signing key; fix trust by hand"
+    chmod 0644 "$signing_pub_path"
+    if (( live_install )); then
+        chown root:root "$signing_pub_path"
+    fi
 else
     signing_pub_tmp=$(mktemp "$serve_config_dir/.snapshot-signing.pub.XXXXXX")
     printf '%s\n' "$signing_public_key" >"$signing_pub_tmp"
