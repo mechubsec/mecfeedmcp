@@ -6,6 +6,7 @@
 
 mod clients;
 mod snapshots;
+mod tls;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -24,8 +25,7 @@ use ipnet::IpNet;
 use mecfeedmcp_core::{
     FeedFormat, IndicatorKind, Limits, Policy, PublicKey, TrustedKeys, render_feed,
 };
-use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use serde::{Deserialize, de::IgnoredAny};
 use sha2::{Digest, Sha256};
 use snapshots::Loaded;
@@ -242,7 +242,12 @@ async fn main() -> Result<()> {
         }
     };
     check_client_ca(clients.as_deref(), args.client_ca.as_deref())?;
-    let tls = load_tls(&tls_cert, &tls_key, Arc::new(provider))?;
+    let tls = tls::server_config(
+        &tls_cert,
+        &tls_key,
+        args.client_ca.as_deref(),
+        Arc::new(provider),
+    )?;
     let allow = if args.allow_cidr.is_empty() {
         vec![
             "127.0.0.0/8"
@@ -268,13 +273,13 @@ async fn main() -> Result<()> {
     let router = router(app);
 
     tracing::info!(listen = %args.listen, "mecfeed-serve listening (TLS only)");
-    axum_server::bind_rustls(
-        args.listen,
-        axum_server::tls_rustls::RustlsConfig::from_config(tls),
-    )
-    .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-    .await
-    .context("feed server exited")?;
+    axum_server::bind(args.listen)
+        .acceptor(tls::PeerCertAcceptor::new(
+            axum_server::tls_rustls::RustlsConfig::from_config(tls),
+        ))
+        .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .context("feed server exited")?;
     Ok(())
 }
 
@@ -305,30 +310,6 @@ fn cert_fingerprint(path: &std::path::Path) -> Result<String> {
         .with_context(|| format!("{} holds no certificate", path.display()))?
         .with_context(|| format!("parsing certificate {}", path.display()))?;
     Ok(hex(&Sha256::digest(cert.as_ref())))
-}
-
-fn load_tls(
-    cert_path: &std::path::Path,
-    key_path: &std::path::Path,
-    provider: Arc<rustls::crypto::CryptoProvider>,
-) -> Result<Arc<ServerConfig>> {
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
-        .with_context(|| format!("reading TLS cert {}", cert_path.display()))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("parsing TLS cert {}", cert_path.display()))?;
-    if certs.is_empty() {
-        anyhow::bail!("TLS cert file contained no certificates");
-    }
-    let key = PrivateKeyDer::from_pem_file(key_path)
-        .with_context(|| format!("reading TLS key {}", key_path.display()))?;
-    let mut config = ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .context("selecting TLS protocol versions")?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("building rustls server config")?;
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(Arc::new(config))
 }
 
 fn client_allowed(allow: &[IpNet], addr: SocketAddr) -> bool {
@@ -372,7 +353,15 @@ async fn require_client(
         return next.run(request).await;
     };
     let feed = format!("{format}/{kind}");
-    match clients.authorize(None, request.headers().get(header::AUTHORIZATION), &feed) {
+    let peer = request
+        .extensions()
+        .get::<tls::PeerCert>()
+        .and_then(|peer| peer.0);
+    match clients.authorize(
+        peer.as_ref(),
+        request.headers().get(header::AUTHORIZATION),
+        &feed,
+    ) {
         Ok(_) => next.run(request).await,
         Err(denial) => {
             tracing::info!(
@@ -596,12 +585,18 @@ mod tests {
         FeedVersions, IndicatorKind, Limits, Policy, Proposal, ProposedEntry, PublicKey,
         TrustedKeys, encode_signature_file, signed_message,
     };
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
+        KeyPair,
+    };
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
     use sha2::{Digest, Sha256};
     use std::{
         net::{IpAddr, SocketAddr},
         path::Path,
         time::{SystemTime, UNIX_EPOCH},
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
 
     const DAY: i64 = 86_400;
@@ -1548,5 +1543,183 @@ mod tests {
     fn crate_version_is_nonempty() {
         assert!(!env!("CARGO_PKG_VERSION").is_empty());
         assert!(!mecfeedmcp_core::version().is_empty());
+    }
+
+    struct Pki {
+        ca: CertifiedIssuer<'static, KeyPair>,
+    }
+
+    impl Pki {
+        fn new() -> Self {
+            let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            Self {
+                ca: CertifiedIssuer::self_signed(params, KeyPair::generate().expect("key"))
+                    .expect("ca"),
+            }
+        }
+
+        /// A leaf for `name`: (cert DER, key DER, cert PEM, key PEM).
+        fn leaf(
+            &self,
+            name: &str,
+            usage: ExtendedKeyUsagePurpose,
+        ) -> (
+            CertificateDer<'static>,
+            PrivateKeyDer<'static>,
+            String,
+            String,
+        ) {
+            let mut params = CertificateParams::new(vec![name.to_string()]).expect("params");
+            params.extended_key_usages = vec![usage];
+            let key = KeyPair::generate().expect("key");
+            let cert = params.signed_by(&key, &self.ca).expect("leaf");
+            (
+                cert.der().clone(),
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+                cert.pem(),
+                key.serialize_pem(),
+            )
+        }
+    }
+
+    /// Serve the real router over TLS with `--client-ca` set to `pki`'s CA.
+    async fn start_tls(dir: &Path, pki: &Pki, clients_json: &str) -> SocketAddr {
+        let files = tempfile::tempdir().expect("tls files");
+        let (_, _, cert_pem, key_pem) = pki.leaf("localhost", ExtendedKeyUsagePurpose::ServerAuth);
+        let (cert_path, key_path, ca_path) = (
+            files.path().join("tls.crt"),
+            files.path().join("tls.key"),
+            files.path().join("client-ca.pem"),
+        );
+        std::fs::write(&cert_path, cert_pem).expect("cert");
+        std::fs::write(&key_path, key_pem).expect("key");
+        std::fs::write(&ca_path, pki.ca.pem()).expect("ca");
+        let config = crate::tls::server_config(
+            &cert_path,
+            &key_path,
+            Some(&ca_path),
+            std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .expect("server config");
+        let app = App {
+            snapshot_dir: dir.to_path_buf(),
+            allow: vec!["127.0.0.0/8".parse().expect("loopback")],
+            policy: empty_policy(),
+            trusted: trusted(&[&test_key(1)]),
+            clients: Some(std::sync::Arc::new(
+                crate::clients::Clients::from_json(clients_json.as_bytes()).expect("clients"),
+            )),
+            reload: std::sync::Arc::default(),
+            cache: std::sync::Arc::default(),
+        };
+        let handle = axum_server::Handle::new();
+        let server = axum_server::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .handle(handle.clone())
+            .acceptor(crate::tls::PeerCertAcceptor::new(
+                axum_server::tls_rustls::RustlsConfig::from_config(config),
+            ));
+        tokio::spawn(server.serve(router(app).into_make_service_with_connect_info::<SocketAddr>()));
+        handle.listening().await.expect("bound")
+    }
+
+    /// GET the panos-edl address feed over TLS; returns the raw response.
+    async fn tls_get(
+        addr: SocketAddr,
+        pki: &Pki,
+        client: Option<(CertificateDer<'static>, PrivateKeyDer<'static>)>,
+        authorization: Option<String>,
+    ) -> std::io::Result<String> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(pki.ca.der().clone()).expect("root");
+        let builder = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("versions")
+        .with_root_certificates(roots);
+        let config = match client {
+            Some((cert, key)) => builder
+                .with_client_auth_cert(vec![cert], key)
+                .expect("client cert"),
+            None => builder.with_no_client_auth(),
+        };
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        let mut tls = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+            .connect(ServerName::try_from("localhost").expect("name"), tcp)
+            .await?;
+        let mut request = String::from(
+            "GET /feeds/panos-edl/address HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n",
+        );
+        if let Some(value) = authorization {
+            request.push_str(&format!("Authorization: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        tls.write_all(request.as_bytes()).await?;
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await?;
+        Ok(String::from_utf8_lossy(&response).into_owned())
+    }
+
+    fn tls_clients(pinned: &CertificateDer<'_>) -> String {
+        format!(
+            r#"{{"version":1,"clients":[
+                {{"name":"vsrx-ci","cert_sha256":"{}","feeds":["panos-edl/address"]}},
+                {{"name":"panosvm","basic_sha256":"{}","feeds":["panos-edl/address"]}}
+            ]}}"#,
+            hex(&Sha256::digest(pinned.as_ref())),
+            hex(&Sha256::digest(b"pw")),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_pinned_client_certificate_gets_the_feed() {
+        let dir = one_version_dir();
+        let pki = Pki::new();
+        let (cert, key, _, _) = pki.leaf("vsrx-ci", ExtendedKeyUsagePurpose::ClientAuth);
+        let addr = start_tls(dir.path(), &pki, &tls_clients(&cert)).await;
+        let response = tls_get(addr, &pki, Some((cert, key)), None)
+            .await
+            .expect("response");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_ca_signed_but_unlisted_certificate_is_401() {
+        let dir = one_version_dir();
+        let pki = Pki::new();
+        let (pinned, _, _, _) = pki.leaf("vsrx-ci", ExtendedKeyUsagePurpose::ClientAuth);
+        let (other, other_key, _, _) = pki.leaf("other", ExtendedKeyUsagePurpose::ClientAuth);
+        let addr = start_tls(dir.path(), &pki, &tls_clients(&pinned)).await;
+        let response = tls_get(addr, &pki, Some((other, other_key)), None)
+            .await
+            .expect("response");
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_certificate_from_another_ca_fails_the_handshake() {
+        let dir = one_version_dir();
+        let pki = Pki::new();
+        let (pinned, _, _, _) = pki.leaf("vsrx-ci", ExtendedKeyUsagePurpose::ClientAuth);
+        let foreign = Pki::new();
+        let (cert, key, _, _) = foreign.leaf("vsrx-ci", ExtendedKeyUsagePurpose::ClientAuth);
+        let addr = start_tls(dir.path(), &pki, &tls_clients(&pinned)).await;
+        // TLS 1.3 may report the rejection on the first read rather than at connect.
+        if let Ok(response) = tls_get(addr, &pki, Some((cert, key)), None).await {
+            assert!(!response.starts_with("HTTP/"), "{response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_certificate_with_good_basic_gets_the_feed() {
+        let dir = one_version_dir();
+        let pki = Pki::new();
+        let (pinned, _, _, _) = pki.leaf("vsrx-ci", ExtendedKeyUsagePurpose::ClientAuth);
+        let addr = start_tls(dir.path(), &pki, &tls_clients(&pinned)).await;
+        let response = tls_get(addr, &pki, None, Some(basic_header("panosvm", "pw")))
+            .await
+            .expect("response");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     }
 }
