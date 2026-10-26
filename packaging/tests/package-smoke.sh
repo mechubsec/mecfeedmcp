@@ -242,9 +242,34 @@ stage_pub="$stage_root/etc/mecfeed-serve/snapshot-signing.pub"
 [[ -f "$stage_key" && -f "$stage_pub" ]] || exit 1
 signing_files=("$stage_key" "$stage_pub")
 sha256sum "${signing_files[@]}" >"$work_dir/signing.sha256"
-stage_install >/dev/null
+# The key exists now, so only --print runs; its stderr must still reach the operator.
+stage_install >/dev/null 2>"$work_dir/reinstall.err"
+grep -Fq 'snapshot signing key id:' "$work_dir/reinstall.err"
 sha256sum -c "$work_dir/preserved.sha256" >/dev/null
 sha256sum -c "$work_dir/signing.sha256" >/dev/null
+if grep -Fq -- 'lacks --trusted-snapshot-key' "$work_dir/stale-unit.err"; then
+    printf '%s\n' 'installer warned about the packaged mecfeed-serve unit' >&2
+    exit 1
+fi
+
+# The last ExecStart across the unit and its drop-ins is what systemd runs.
+mcp_dropin_dir="$stage_root/etc/systemd/system/mecfeedmcp.service.d"
+serve_dropin_dir="$stage_root/etc/systemd/system/mecfeed-serve.service.d"
+mkdir -p "$mcp_dropin_dir" "$serve_dropin_dir"
+printf '%s\n' '[Service]' 'ExecStart=' "ExecStart = /usr/local/bin/mecfeedmcp \\" \
+    '# a comment inside a continuation is skipped' \
+    '    --snapshot-signing-key-file /var/lib/mecfeedmcp/snapshot-signing.key' >"$mcp_dropin_dir/10-signing.conf"
+# systemd ignores an ExecStart outside [Service], so the misplaced flag must not count.
+printf '%s\n' '[Service]' 'ExecStart=' 'ExecStart=/usr/local/bin/mecfeed-serve --listen 0.0.0.0:8443' \
+    '[Unit]' 'ExecStart=/usr/local/bin/mecfeed-serve --trusted-snapshot-key /etc/mecfeed-serve/x.pub' \
+    >"$serve_dropin_dir/10-stale.conf"
+stage_install >/dev/null 2>"$work_dir/dropin.err"
+if grep -Fq -- 'lacks --snapshot-signing-key-file' "$work_dir/dropin.err"; then
+    printf '%s\n' 'installer ignored a drop-in that supplies the signing-key flag' >&2
+    exit 1
+fi
+grep -Fq -- 'lacks --trusted-snapshot-key' "$work_dir/dropin.err"
+rm -r "$mcp_dropin_dir" "$serve_dropin_dir"
 
 # A retained matching .pub is normalized to 0644 (staged mode cannot chown).
 chmod 0600 "$stage_pub"
@@ -283,6 +308,22 @@ if MECFEEDMCP_INSTALL_ROOT="$open_dir_root" \
 fi
 grep -Fq 'is writable by group or other' "$work_dir/open-dir.err"
 [[ ! -e "$open_dir_root/etc/mecfeed-serve/snapshot-signing.pub" ]] || exit 1
+
+# A malformed signing key fails the install and the binary's own error is shown.
+bad_key_root="$work_dir/bad-key-root"
+mkdir -p "$bad_key_root/var/lib/mecfeedmcp"
+printf '%s\n' 'not a signing key' >"$bad_key_root/var/lib/mecfeedmcp/snapshot-signing.key"
+chmod 0600 "$bad_key_root/var/lib/mecfeedmcp/snapshot-signing.key"
+if MECFEEDMCP_INSTALL_ROOT="$bad_key_root" \
+    MECFEEDMCP_INSTALL_SKIP_USER=1 \
+    MECFEEDMCP_INSTALL_SKIP_SYSTEMD_RELOAD=1 \
+    MECFEEDMCP_INSTALL_SKIP_RUNTIME_DEPS=1 \
+    "$installer" >/dev/null 2>"$work_dir/bad-key.err"; then
+    printf '%s\n' 'installer accepted a malformed signing key' >&2
+    exit 1
+fi
+grep -Fq 'cannot read the snapshot signing key' "$work_dir/bad-key.err"
+grep -Fq 'invalid key encoding' "$work_dir/bad-key.err"
 
 unsafe_root="$work_dir/unsafe-root"
 sentinel_dir="$work_dir/sentinels"

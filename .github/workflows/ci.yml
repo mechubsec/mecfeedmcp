@@ -103,8 +103,11 @@ jobs:
             mecfeedmcp:ci --print-snapshot-signing-public-key > print.out
           cmp init.out print.out || { echo "FAIL: init and print disagree"; exit 1; }
           [ "$(sudo stat -c %a "$state_dir/snapshot-signing.key")" = 600 ] || { echo "FAIL: key mode is not 0600"; exit 1; }
-          if docker run --rm -v "$state_dir:/var/lib/mecfeedmcp" --user 65532:65532 \
-            mecfeedmcp:ci --init-snapshot-signing-key; then echo "FAIL: init overwrote a key"; exit 1; fi
+          key_hash_before=$(sudo sha256sum "$state_dir/snapshot-signing.key")
+          if reinit_stderr=$(docker run --rm -v "$state_dir:/var/lib/mecfeedmcp" --user 65532:65532 \
+            mecfeedmcp:ci --init-snapshot-signing-key 2>&1 >/dev/null); then echo "FAIL: init overwrote a key"; exit 1; fi
+          echo "$reinit_stderr" | grep -q 'already exists' || { echo "FAIL: re-init failed for another reason: $reinit_stderr"; exit 1; }
+          [ "$(sudo sha256sum "$state_dir/snapshot-signing.key")" = "$key_hash_before" ] || { echo "FAIL: re-init changed the key"; exit 1; }
           echo "PASS: snapshot signing key created once and printed"
 
   packaging:

@@ -267,7 +267,7 @@ assert_installer_reguards_before_mutation() {
     if grep -Fq '>"$hmac_path"' "$installer"; then
         fail 'audit-hmac.key must be created via mktemp + install(1), not a direct redirect'
     fi
-    require_contains 'install -m 0600 "$tokens_tmp" "$tokens_path"' "$installer"
+    require_contains 'run_as_service_user install -m 0600 "$tokens_tmp" "$tokens_path"' "$installer"
     require_contains 'install -m 0600 "$hmac_tmp" "$hmac_path"' "$installer"
     if grep -Fq 'chown mecfeedmcp:mecfeedmcp "$tokens_path"' "$installer"; then
         fail 'tokens.json chown must use chown -h, not a plain follow-symlink chown'
