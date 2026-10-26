@@ -212,9 +212,13 @@ changed after that is noticed at the next publish or serve restart.
 Every feed request needs a client listed in `--clients-file`. A request with no
 or wrong credentials gets 401. A listed client asking for a feed not in its
 `feeds` list gets 403. `/healthz` is open to the CIDR allowlist and needs no
-credentials. `--allow-cidr` still runs first. `--allow-anonymous-feeds` is the
-explicit opt-out: CIDR-only access, and it conflicts with `--clients-file` and
-`--client-ca`.
+credentials. `--allow-cidr` still runs first. Serve needs exactly one of
+`--clients-file` and `--allow-anonymous-feeds`, the explicit opt-out to
+CIDR-only access. `--client-ca` is refused with `--allow-anonymous-feeds`. The
+Docker image always passes `--clients-file`, so anonymous mode there needs
+`--entrypoint /usr/local/bin/mecfeed-serve` followed by the image's full
+argument list from `Dockerfile.serve`, with `--allow-anonymous-feeds` in place
+of `--clients-file <path>`.
 
 The file:
 
@@ -257,8 +261,10 @@ SRX mTLS:
 1. Issue the SRX a client certificate from a client CA.
 2. Start serve with `--client-ca <ca.pem>`. With systemd, copy the current
    `ExecStart` into a drop-in and add the flag, then `systemctl daemon-reload`
-   and restart. With Docker, mount the CA and pass the flag after the image
-   name, re-passing `--listen` and every `--allow-cidr`. `--client-ca` is
+   and restart. With Docker, mount the CA readable by uid 65532
+   (`-v "$PWD/client-ca.pem:/etc/mecfeed-serve/client-ca.pem:ro"`) and pass
+   `--client-ca /etc/mecfeed-serve/client-ca.pem` after the image name,
+   re-passing `--listen` and every `--allow-cidr`. `--client-ca` is
    required whenever a client has `cert_sha256`.
 3. Pin the certificate: run `mecfeed-serve --print-cert-fingerprint <srx-cert.pem>`
    and put the output in the client's `cert_sha256`.
