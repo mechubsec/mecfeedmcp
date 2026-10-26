@@ -127,6 +127,7 @@ impl Clients {
             bail!("client list version must be 1");
         }
         let mut names = BTreeSet::new();
+        let mut pins = BTreeSet::new();
         let mut clients = Vec::with_capacity(file.clients.len());
         for entry in file.clients {
             if !valid_name(&entry.name) {
@@ -149,6 +150,10 @@ impl Clients {
                 .map(decode_sha256)
                 .transpose()
                 .with_context(|| format!("client {name}: cert_sha256"))?;
+            // authorize() takes the first pin match, so a shared pin would make access order-dependent.
+            if cert_sha256.is_some_and(|pin| !pins.insert(pin)) {
+                bail!("client {name}: cert_sha256 is a certificate pinned by an earlier client");
+            }
             if basic_sha256.is_none() && cert_sha256.is_none() {
                 bail!("client {name} needs basic_sha256 or cert_sha256");
             }
@@ -364,6 +369,12 @@ mod tests {
                     r#"{{"version":1,"clients":[{{"name":"a","basic_sha256":"{hash}","feeds":["panos-edl/address"]}},{{"name":"a","basic_sha256":"{hash}","feeds":["panos-edl/address"]}}]}}"#
                 ),
                 "listed twice",
+            ),
+            (
+                format!(
+                    r#"{{"version":1,"clients":[{{"name":"a","cert_sha256":"{hash}","feeds":["panos-edl/address"]}},{{"name":"b","cert_sha256":"{hash}","feeds":["panos-edl/domain"]}}]}}"#
+                ),
+                "certificate pinned by an earlier client",
             ),
             (
                 one(r#"{"name":"a","basic_sha256":"abc","feeds":["panos-edl/address"]}"#),

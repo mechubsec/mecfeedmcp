@@ -63,7 +63,7 @@ Parsing is strict:
 - `name` is the Basic username. It matches `[A-Za-z0-9._-]{1,64}`, so it never
   contains `:` or whitespace. Names are unique.
 - A client has `basic_sha256`, `cert_sha256`, or both. Each is exactly 64
-  lowercase hex characters.
+  lowercase hex characters. A `cert_sha256` is unique across clients.
 - `feeds` is non-empty. Each entry is `<format>/<kind>` using the existing
   route tokens (`parse_format`, `parse_kind`) where `FeedFormat::supports(kind)`
   holds, so a typo fails at startup. Duplicate entries are refused.
@@ -205,7 +205,7 @@ Upgrade (Docker): create `clients.json`, mount it, and recreate serve.
 Startup refuses, with a message naming the file and the field:
 
 - a malformed client list
-- a duplicate name or feed
+- a duplicate name, feed or certificate pin
 - an unsupported feed
 - a certificate client without `--client-ca`
 - `--client-ca` together with `--allow-anonymous-feeds`
