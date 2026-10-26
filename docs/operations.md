@@ -1,8 +1,8 @@
 # Operations
 
 > 🚧 **Under construction.** The MCP server publishes an approved snapshot
-> and can read MISP. `mecfeed-serve` serves verified snapshots; auth, abuse
-> limits, and the security review are not done. Do not deploy it.
+> and can read MISP. `mecfeed-serve` serves verified snapshots with client
+> authentication; abuse limits and the security review are not done. Do not deploy it.
 
 The shared `mecmcp` crates are pinned — to `v0.28.1`.
 
@@ -45,7 +45,7 @@ loopback-only allowlist rejects every client. Use host networking, or pass
 verified snapshot and answers 503 when the snapshot log does not verify.
 Formats: `panos-edl`, `junos-dynamic-address`, `fortigate-threat-feed`,
 `opnsense-url-table`. Kinds: `address`, `prefix`, `domain` (Junos has no
-`domain`). Everything else is 404.
+`domain`). A feed path without valid credentials gets 401; every other path is 404.
 
 `mecfeed-serve` requires `--feed-config` (the MCP server's `feed.json`). It reads
 the operator allowlists at startup and applies them to the current snapshot on
@@ -174,7 +174,7 @@ loopback only).
 4. Publish one version.
 5. Replace the mounted `snapshot-signing.pub` with `next.pub` (`0644`) and
    recreate serve with the same arguments as before (`--listen`, each
-   `--allow-cidr`), without the extra mount and `--trusted-snapshot-key`. Then
+   `--allow-cidr`, and `--client-ca` when it is used), without the extra mount and `--trusted-snapshot-key`. Then
    `sudo rm -r next`.
 
 Upgrading from an unsigned release (systemd/LXC):
@@ -217,7 +217,8 @@ credentials. `--allow-cidr` still runs first. Serve needs exactly one of
 CIDR-only access. `--client-ca` is refused with `--allow-anonymous-feeds`. The
 Docker image always passes `--clients-file`, so anonymous mode there needs
 `--entrypoint /usr/local/bin/mecfeed-serve` followed by the image's full
-argument list from `Dockerfile.serve`, with `--allow-anonymous-feeds` in place
+argument list from `Dockerfile.serve` (including `--listen 0.0.0.0:8443`,
+because Docker clears CMD when `--entrypoint` is set), with `--allow-anonymous-feeds` in place
 of `--clients-file <path>`.
 
 The file:
@@ -258,8 +259,10 @@ server, with the URL
 
 SRX mTLS:
 
-1. Issue the SRX a client certificate from a client CA.
-2. Start serve with `--client-ca <ca.pem>`. With systemd, copy the current
+1. Issue the SRX a client certificate from a client CA, with the clientAuth
+   EKU or no EKU (a serverAuth-only certificate is rejected).
+2. Start serve with `--client-ca <ca.pem>`. With systemd, put the CA at
+   `/etc/mecfeed-serve/client-ca.pem` (`0644 root`), copy the current
    `ExecStart` into a drop-in and add the flag, then `systemctl daemon-reload`
    and restart. With Docker, mount the CA readable by uid 65532
    (`-v "$PWD/client-ca.pem:/etc/mecfeed-serve/client-ca.pem:ro"`) and pass

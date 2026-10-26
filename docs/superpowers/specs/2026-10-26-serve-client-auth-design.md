@@ -127,8 +127,8 @@ Identification:
   clients, the request is authorized when either client lists the feed.
 
 Authorization: the request path's `<format>/<kind>` must be in an identified
-client's `feeds`. The path segments are compared as raw strings against the
-validated list. An unlisted or unknown path is not allowed.
+client's `feeds`. The code compares the percent-decoded path segments, the ones the
+handler uses, against the validated list. An unlisted or unknown path is not allowed.
 
 Responses:
 
