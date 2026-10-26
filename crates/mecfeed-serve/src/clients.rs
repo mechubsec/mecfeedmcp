@@ -105,6 +105,13 @@ pub(crate) fn load(path: &Path) -> Result<Clients> {
 }
 
 impl Clients {
+    /// Whether any client authenticates by certificate, which needs `--client-ca`.
+    pub(crate) fn needs_client_ca(&self) -> bool {
+        self.clients
+            .iter()
+            .any(|client| client.cert_sha256.is_some())
+    }
+
     /// Parse and validate a client list.
     ///
     /// # Errors
