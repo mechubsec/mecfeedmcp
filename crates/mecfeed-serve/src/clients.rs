@@ -55,7 +55,10 @@ pub(crate) enum Denial {
     /// The Basic user is not in the list.
     UnknownUser,
     /// The Basic password does not match, or the client has no Basic hash.
-    BadPassword,
+    BadPassword {
+        /// The listed client the user name matched.
+        client: String,
+    },
     /// A CA-valid certificate that no client pins, and no Basic credentials.
     CertNotListed,
     /// An identified client asked for a feed it is not listed for.
@@ -71,7 +74,7 @@ impl Denial {
         match self {
             Self::NoCredentials => "no-credentials",
             Self::UnknownUser => "unknown-user",
-            Self::BadPassword => "bad-password",
+            Self::BadPassword { .. } => "bad-password",
             Self::CertNotListed => "cert-not-listed",
             Self::FeedNotAllowed { .. } => "feed-not-allowed",
         }
@@ -80,7 +83,7 @@ impl Denial {
     /// The identified client, when there is one.
     pub(crate) fn client(&self) -> Option<&str> {
         match self {
-            Self::FeedNotAllowed { client } => Some(client),
+            Self::BadPassword { client } | Self::FeedNotAllowed { client } => Some(client),
             _ => None,
         }
     }
@@ -93,7 +96,8 @@ impl Denial {
 /// Returns an error when the file is not a regular file, is over 1 MiB, or
 /// does not validate.
 pub(crate) fn load(path: &Path) -> Result<Clients> {
-    let file = crate::snapshots::open_regular(path, "client list")?;
+    let file = crate::snapshots::open_regular(path, "client list")
+        .with_context(|| format!("client list {}", path.display()))?;
     let mut bytes = Vec::new();
     file.take(MAX_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -231,7 +235,9 @@ impl Clients {
         if bool::from(expected.ct_eq(&digest)) && client.basic_sha256.is_some() {
             Ok(client)
         } else {
-            Err(Denial::BadPassword)
+            Err(Denial::BadPassword {
+                client: client.name.clone(),
+            })
         }
     }
 }
@@ -322,6 +328,40 @@ mod tests {
             "{:#}",
             Clients::from_json(json.as_bytes()).err().expect("refused")
         )
+    }
+
+    // FIFOs are refused by `open_regular` and tested where it is defined (snapshots_test.rs).
+    #[test]
+    fn load_refuses_unsafe_files_and_names_the_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let valid = br#"{"version":1,"clients":[]}"#;
+        let real = dir.path().join("real.json");
+        std::fs::write(&real, valid).expect("write");
+
+        let link = dir.path().join("link.json");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let error = format!("{:#}", super::load(&link).err().expect("symlink refused"));
+        assert!(error.contains(&link.display().to_string()), "{error}");
+
+        let missing = dir.path().join("missing.json");
+        let error = format!(
+            "{:#}",
+            super::load(&missing).err().expect("missing refused")
+        );
+        assert!(error.contains(&missing.display().to_string()), "{error}");
+
+        let limit = usize::try_from(super::MAX_FILE_BYTES).expect("limit fits");
+        let mut padded = valid.to_vec();
+        padded.resize(limit, b' ');
+        let exact = dir.path().join("exact.json");
+        std::fs::write(&exact, &padded).expect("write");
+        super::load(&exact).expect("exactly 1 MiB loads");
+
+        padded.push(b' ');
+        let over = dir.path().join("over.json");
+        std::fs::write(&over, &padded).expect("write");
+        let error = format!("{:#}", super::load(&over).err().expect("over refused"));
+        assert!(error.contains("larger than 1 MiB"), "{error}");
     }
 
     #[test]
@@ -471,18 +511,28 @@ mod tests {
         let cases = [
             (None, None, Denial::NoCredentials),
             (None, Some(basic("nobody", "s3cret")), Denial::UnknownUser),
-            (None, Some(basic("panosvm", "wrong")), Denial::BadPassword),
+            (
+                None,
+                Some(basic("panosvm", "wrong")),
+                Denial::BadPassword {
+                    client: "panosvm".to_string(),
+                },
+            ),
             // A certificate-only client cannot use Basic.
             (
                 None,
                 Some(basic("vsrx-ci", "anything")),
-                Denial::BadPassword,
+                Denial::BadPassword {
+                    client: "vsrx-ci".to_string(),
+                },
             ),
             (Some([9u8; 32]), None, Denial::CertNotListed),
             (
                 Some([9u8; 32]),
                 Some(basic("panosvm", "wrong")),
-                Denial::BadPassword,
+                Denial::BadPassword {
+                    client: "panosvm".to_string(),
+                },
             ),
         ];
         for (cert, header, want) in cases {

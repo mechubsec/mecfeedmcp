@@ -433,7 +433,9 @@ if [[ ! -e "$clients_path" ]]; then
     clients_tmp=$(mktemp "$serve_config_dir/.clients.json.XXXXXX")
     printf '%s\n' '{"version":1,"clients":[]}' >"$clients_tmp"
     chmod 0640 "$clients_tmp"
-    mv -fT -- "$clients_tmp" "$clients_path"
+    # link(2) fails with EEXIST instead of replacing a list that appeared since the check.
+    ln -T -- "$clients_tmp" "$clients_path" || [[ -e "$clients_path" ]] || die "cannot create $clients_path"
+    rm -f -- "$clients_tmp"
 fi
 
 # systemd runs the last ExecStart= across the unit and its drop-ins (read in

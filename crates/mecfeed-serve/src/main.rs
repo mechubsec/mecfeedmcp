@@ -232,9 +232,13 @@ async fn main() -> Result<()> {
 
     let policy = load_policy(&feed_config)?;
     let trusted = load_trusted_keys(&args.trusted_snapshot_key)?;
-    let clients = match &args.clients_file {
-        Some(path) => Some(Arc::new(clients::load(path)?)),
-        None => {
+    // clap enforces this too; this is the fail-closed backstop.
+    let clients = match (&args.clients_file, args.allow_anonymous_feeds) {
+        (Some(path), _) => Some(Arc::new(clients::load(path)?)),
+        (None, false) => {
+            anyhow::bail!("--clients-file is required unless --allow-anonymous-feeds is set")
+        }
+        (None, true) => {
             tracing::warn!(
                 "--allow-anonymous-feeds: feeds are served without client authentication"
             );
@@ -876,6 +880,31 @@ mod tests {
         let (parts, body) = response.into_parts();
         let bytes = to_bytes(body, usize::MAX).await.expect("body");
         (parts.status, parts.headers, bytes.to_vec())
+    }
+
+    #[tokio::test]
+    async fn path_variants_never_serve_without_credentials() {
+        let dir = one_version_dir();
+        let app = app_with_clients(dir.path());
+        // 404 where the route shape does not match; 401 where it does. Never 200.
+        let cases = [
+            ("/feeds/panos-edl/address/", StatusCode::NOT_FOUND),
+            ("/feeds//panos-edl/address", StatusCode::NOT_FOUND),
+            ("/feeds/panos-edl%2Faddress", StatusCode::NOT_FOUND),
+            ("/feeds/PANOS-EDL/address", StatusCode::UNAUTHORIZED),
+            ("/FEEDS/panos-edl/address", StatusCode::NOT_FOUND),
+            ("/feeds/panos-edl/address?x=1", StatusCode::UNAUTHORIZED),
+            ("/feeds/panos-edl/%61ddress", StatusCode::UNAUTHORIZED),
+        ];
+        for (uri, want) in cases {
+            let (status, _, _) = send_as(&app, Method::GET, uri, None).await;
+            assert_eq!(status, want, "{uri}");
+        }
+        // `%61ddress` decodes to `address`: authorization and the handler agree on it.
+        let good = basic_header("panosvm", PANOS_PASSWORD);
+        let (status, _, _) =
+            send_as(&app, Method::GET, "/feeds/panos-edl/%61ddress", Some(&good)).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1701,10 +1730,15 @@ mod tests {
     async fn a_certificate_from_another_ca_fails_the_handshake() {
         let dir = one_version_dir();
         let pki = Pki::new();
-        let (pinned, _, _, _) = pki.leaf("vsrx-ci", ExtendedKeyUsagePurpose::ClientAuth);
+        let (pinned, pinned_key, _, _) = pki.leaf("vsrx-ci", ExtendedKeyUsagePurpose::ClientAuth);
         let foreign = Pki::new();
         let (cert, key, _, _) = foreign.leaf("vsrx-ci", ExtendedKeyUsagePurpose::ClientAuth);
         let addr = start_tls(dir.path(), &pki, &tls_clients(&pinned)).await;
+        // The same listener serves the pinned certificate, so the refusal below is the CA.
+        let accepted = tls_get(addr, &pki, Some((pinned, pinned_key)), None)
+            .await
+            .expect("pinned certificate response");
+        assert!(accepted.starts_with("HTTP/1.1 200"), "{accepted}");
         // TLS 1.3 may report the rejection on the first read rather than at connect.
         if let Ok(response) = tls_get(addr, &pki, Some((cert, key)), None).await {
             assert!(!response.starts_with("HTTP/"), "{response}");
