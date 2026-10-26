@@ -46,7 +46,7 @@ fn is_symlink(path: &Path) -> bool {
 
 /// Open `path` read-only as a regular file. `O_NOFOLLOW` refuses a symlink and
 /// `O_NONBLOCK` keeps `open(2)` on a FIFO from blocking; the type check then rejects it.
-fn open_regular(path: &Path, name: &str) -> Result<File> {
+pub(crate) fn open_regular(path: &Path, name: &str) -> Result<File> {
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)

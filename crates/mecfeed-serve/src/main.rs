@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod clients;
 mod snapshots;
 
 use anyhow::{Context, Result};
@@ -17,6 +18,7 @@ use axum::{
     routing::any,
 };
 use clap::Parser;
+use clients::{Clients, Denial};
 use ipnet::IpNet;
 use mecfeedmcp_core::{
     FeedFormat, IndicatorKind, Limits, Policy, PublicKey, TrustedKeys, render_feed,
@@ -66,6 +68,17 @@ struct Args {
     /// Client IP/CIDR allowlist. Repeatable. Empty means loopback only.
     #[arg(long = "allow-cidr")]
     allow_cidr: Vec<IpNet>,
+
+    #[arg(
+        long,
+        conflicts_with = "allow_anonymous_feeds",
+        required_unless_present = "allow_anonymous_feeds"
+    )]
+    clients_file: Option<PathBuf>,
+
+    /// Serve feeds to any client the CIDR allowlist admits, without client authentication.
+    #[arg(long)]
+    allow_anonymous_feeds: bool,
 }
 
 /// The slice of feed.json that serve needs. MCP-only keys are accepted but not
@@ -154,6 +167,8 @@ struct App {
     policy: Policy,
     /// Keys the current snapshot's signature must verify against.
     trusted: TrustedKeys,
+    /// Feed clients; `None` when `--allow-anonymous-feeds` was given.
+    clients: Option<Arc<Clients>>,
     /// Serializes reloads so an older load can never overwrite a newer one.
     reload: Arc<tokio::sync::Mutex<()>>,
     /// Last fully verified load. Readers only ever see a complete, verified set.
@@ -185,6 +200,15 @@ async fn main() -> Result<()> {
 
     let policy = load_policy(&args.feed_config)?;
     let trusted = load_trusted_keys(&args.trusted_snapshot_key)?;
+    let clients = match &args.clients_file {
+        Some(path) => Some(Arc::new(clients::load(path)?)),
+        None => {
+            tracing::warn!(
+                "--allow-anonymous-feeds: feeds are served without client authentication"
+            );
+            None
+        }
+    };
     let tls = load_tls(&args.tls_cert, &args.tls_key, Arc::new(provider))?;
     let allow = if args.allow_cidr.is_empty() {
         vec![
@@ -204,6 +228,7 @@ async fn main() -> Result<()> {
         allow,
         policy,
         trusted,
+        clients,
         reload: Arc::default(),
         cache: Arc::default(),
     };
@@ -269,10 +294,53 @@ async fn require_allowed_client(
     next.run(request).await
 }
 
+/// `WWW-Authenticate` value on every 401.
+const BASIC_CHALLENGE: &str = "Basic realm=\"mecfeed\", charset=\"UTF-8\"";
+
+/// Feed-route client authentication. Runs before the format and kind are parsed,
+/// so an unauthenticated caller learns nothing about which feeds exist.
+async fn require_client(
+    State(app): State<App>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path((format, kind)): Path<(String, String)>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(clients) = &app.clients else {
+        return next.run(request).await;
+    };
+    let feed = format!("{format}/{kind}");
+    match clients.authorize(None, request.headers().get(header::AUTHORIZATION), &feed) {
+        Ok(_) => next.run(request).await,
+        Err(denial) => {
+            tracing::info!(
+                client_ip = %addr.ip(),
+                client = denial.client().unwrap_or(""),
+                reason = denial.reason(),
+                "feed request denied"
+            );
+            if matches!(denial, Denial::FeedNotAllowed { .. }) {
+                StatusCode::FORBIDDEN.into_response()
+            } else {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    [(
+                        header::WWW_AUTHENTICATE,
+                        HeaderValue::from_static(BASIC_CHALLENGE),
+                    )],
+                )
+                    .into_response()
+            }
+        }
+    }
+}
+
 fn router(app: App) -> Router {
     Router::new()
-        .route("/healthz", any(healthz))
         .route("/feeds/{format}/{kind}", any(feed))
+        // Only the feed route above is covered; routes added after it are not.
+        .route_layer(middleware::from_fn_with_state(app.clone(), require_client))
+        .route("/healthz", any(healthz))
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(middleware::from_fn_with_state(
             app.clone(),
@@ -603,10 +671,208 @@ mod tests {
             allow: vec!["127.0.0.0/8".parse().expect("loopback")],
             policy,
             trusted: keys,
+            clients: None,
             reload: std::sync::Arc::default(),
             cache: std::sync::Arc::default(),
         })
         .layer(MockConnectInfo(SocketAddr::from((peer, 1))))
+    }
+
+    const PANOS_PASSWORD: &str = "s3cret-password";
+
+    fn panos_clients() -> crate::clients::Clients {
+        let json = format!(
+            r#"{{"version":1,"clients":[{{"name":"panosvm","basic_sha256":"{}","feeds":["panos-edl/address"]}}]}}"#,
+            hex(&Sha256::digest(PANOS_PASSWORD.as_bytes()))
+        );
+        crate::clients::Clients::from_json(json.as_bytes()).expect("clients")
+    }
+
+    fn app_with_clients(dir: &Path) -> axum::Router {
+        router(App {
+            snapshot_dir: dir.to_path_buf(),
+            allow: vec!["127.0.0.0/8".parse().expect("loopback")],
+            policy: empty_policy(),
+            trusted: trusted(&[&test_key(1)]),
+            clients: Some(std::sync::Arc::new(panos_clients())),
+            reload: std::sync::Arc::default(),
+            cache: std::sync::Arc::default(),
+        })
+        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))))
+    }
+
+    fn basic_header(user: &str, password: &str) -> String {
+        format!(
+            "Basic {}",
+            BASE64_STANDARD.encode(format!("{user}:{password}"))
+        )
+    }
+
+    async fn send_as(
+        app: &axum::Router,
+        method: Method,
+        uri: &str,
+        authorization: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(value) = authorization {
+            request = request.header(header::AUTHORIZATION, value);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).expect("request"))
+            .await
+            .expect("response");
+        let (parts, body) = response.into_parts();
+        let bytes = to_bytes(body, usize::MAX).await.expect("body");
+        (parts.status, parts.headers, bytes.to_vec())
+    }
+
+    #[tokio::test]
+    async fn feeds_need_a_listed_client_and_unknown_paths_do_not_leak() {
+        let dir = one_version_dir();
+        let app = app_with_clients(dir.path());
+        for uri in ["/feeds/panos-edl/address", "/feeds/nope/nothing"] {
+            for method in [Method::GET, Method::HEAD] {
+                let (status, headers, body) = send_as(&app, method, uri, None).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+                assert_eq!(
+                    headers.get(header::WWW_AUTHENTICATE).expect("challenge"),
+                    "Basic realm=\"mecfeed\", charset=\"UTF-8\""
+                );
+                assert!(body.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_password_and_unknown_user_are_401() {
+        let dir = one_version_dir();
+        let app = app_with_clients(dir.path());
+        for header_value in [
+            basic_header("panosvm", "wrong"),
+            basic_header("nobody", PANOS_PASSWORD),
+        ] {
+            let (status, _, body) = send_as(
+                &app,
+                Method::GET,
+                "/feeds/panos-edl/address",
+                Some(&header_value),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert!(body.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listed_client_gets_its_feed_and_403_elsewhere() {
+        let dir = one_version_dir();
+        let good = basic_header("panosvm", PANOS_PASSWORD);
+        let app = app_with_clients(dir.path());
+        let (status, headers, body) =
+            send_as(&app, Method::GET, "/feeds/panos-edl/address", Some(&good)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, anonymous_headers, anonymous_body) = send(
+            &app_for_peer(dir.path(), [127, 0, 0, 1]),
+            Method::GET,
+            "/feeds/panos-edl/address",
+            None,
+        )
+        .await;
+        assert_eq!(body, anonymous_body);
+        assert_eq!(
+            headers.get(header::ETAG),
+            anonymous_headers.get(header::ETAG)
+        );
+        let (status, _, body) =
+            send_as(&app, Method::GET, "/feeds/panos-edl/domain", Some(&good)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn healthz_needs_no_client() {
+        let dir = one_version_dir();
+        let (status, _, _) =
+            send_as(&app_with_clients(dir.path()), Method::GET, "/healthz", None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_denied_request_never_logs_the_password() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        // Global, not scoped: a scoped default races other tests' callsite registration and flakes.
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("only this test installs a subscriber");
+        let dir = one_version_dir();
+        let wrong = basic_header("panosvm", "wrong-password-value");
+        let (status, headers, body) = send_as(
+            &app_with_clients(dir.path()),
+            Method::GET,
+            "/feeds/panos-edl/address",
+            Some(&wrong),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let logs = String::from_utf8(captured.0.lock().expect("log buffer").clone()).expect("utf8");
+        assert!(logs.contains("bad-password"), "{logs}");
+        for haystack in [
+            logs.as_str(),
+            &format!("{headers:?}"),
+            &String::from_utf8_lossy(&body),
+        ] {
+            assert!(!haystack.contains("wrong-password-value"));
+            assert!(!haystack.contains(&wrong));
+        }
+    }
+
+    #[test]
+    fn exactly_one_client_mode_is_required() {
+        use clap::Parser;
+        let base = [
+            "mecfeed-serve",
+            "--tls-cert",
+            "c",
+            "--tls-key",
+            "k",
+            "--feed-config",
+            "f",
+            "--snapshot-dir",
+            "d",
+            "--trusted-snapshot-key",
+            "p",
+        ];
+        assert!(super::Args::try_parse_from(base).is_err());
+        assert!(
+            super::Args::try_parse_from(base.iter().chain(&["--allow-anonymous-feeds"])).is_ok()
+        );
+        assert!(super::Args::try_parse_from(base.iter().chain(&["--clients-file", "x"])).is_ok());
+        assert!(
+            super::Args::try_parse_from(base.iter().chain(&[
+                "--clients-file",
+                "x",
+                "--allow-anonymous-feeds"
+            ]))
+            .is_err()
+        );
     }
 
     fn two_version_dir() -> tempfile::TempDir {
