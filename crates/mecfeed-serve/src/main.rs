@@ -69,6 +69,7 @@ struct Args {
     #[arg(long = "allow-cidr")]
     allow_cidr: Vec<IpNet>,
 
+    /// Feed client list (JSON). Every feed request must come from a listed client.
     #[arg(
         long,
         conflicts_with = "allow_anonymous_feeds",

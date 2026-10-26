@@ -111,7 +111,11 @@ impl Clients {
     ///
     /// Returns an error naming the first client and field that is not acceptable.
     pub(crate) fn from_json(bytes: &[u8]) -> Result<Self> {
-        let file: ClientsFile = serde_json::from_slice(bytes).context("parsing client list")?;
+        // serde echoes unknown field names, which the 1 MiB cap alone does not bound.
+        let file: ClientsFile = serde_json::from_slice(bytes).map_err(|error| {
+            let message: String = error.to_string().chars().take(200).collect();
+            anyhow::anyhow!("parsing client list: {message}")
+        })?;
         if file.version != 1 {
             bail!("client list version must be 1");
         }
@@ -312,6 +316,14 @@ mod tests {
     fn a_valid_list_loads_and_an_empty_one_is_allowed() {
         let _ = list();
         Clients::from_json(br#"{"version":1,"clients":[]}"#).expect("empty list");
+    }
+
+    #[test]
+    fn a_parse_error_does_not_echo_an_unbounded_field_name() {
+        let json = format!(r#"{{"version":1,"clients":[],"{}":1}}"#, "x".repeat(5000));
+        let error = refused(&json);
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.len() < 400, "{} bytes", error.len());
     }
 
     #[test]
