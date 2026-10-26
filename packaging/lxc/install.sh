@@ -9,7 +9,7 @@ die() {
 }
 
 cleanup_tmp_files() {
-    rm -f "${tokens_tmp:-}" "${hmac_tmp:-}" "${signing_pub_tmp:-}"
+    rm -f "${tokens_tmp:-}" "${hmac_tmp:-}" "${signing_pub_tmp:-}" "${clients_tmp:-}"
 }
 trap cleanup_tmp_files EXIT
 
@@ -209,6 +209,7 @@ hmac_path=$(target_path /etc/mecfeedmcp/audit-hmac.key)
 signing_key_path=$(target_path /var/lib/mecfeedmcp/snapshot-signing.key)
 serve_config_dir=$(target_path /etc/mecfeed-serve)
 signing_pub_path="$serve_config_dir/snapshot-signing.pub"
+clients_path="$serve_config_dir/clients.json"
 
 reject_unsafe_directory() {
     local path=$1
@@ -254,6 +255,7 @@ reject_unsafe_parent_dirs "$snapshot_dir/.parent-validation"
 managed_destinations=(
     "$bin_path" "$config_dir/feed.json.example" "$sysusers_path" "$tmpfiles_path"
     "$unit_path" "$tokens_path" "$hmac_path" "$signing_key_path" "$signing_pub_path"
+    "$clients_path"
 )
 for destination in "${managed_destinations[@]}"; do
     reject_unsafe_file "$destination"
@@ -425,13 +427,28 @@ reject_unsafe_file "$signing_pub_tmp"
 chmod 0644 "$signing_pub_tmp"
 mv -fT -- "$signing_pub_tmp" "$signing_pub_path"
 
+# Starter client list: empty, so every feed answers 401 until an operator adds a client.
+reject_unsafe_file "$clients_path"
+if [[ ! -e "$clients_path" ]]; then
+    clients_tmp=$(mktemp "$serve_config_dir/.clients.json.XXXXXX")
+    printf '%s\n' '{"version":1,"clients":[]}' >"$clients_tmp"
+    chmod 0640 "$clients_tmp"
+    mv -fT -- "$clients_tmp" "$clients_path"
+fi
+
 # systemd runs the last ExecStart= across the unit and its drop-ins (read in
 # name order), so a drop-in can add a required flag or take it away.
 # shortcut: reads only <unit>.d/*.conf next to the unit, not /run
 # (systemctl edit --runtime, gone at reboot), vendor, service.d/ or prefix
 # drop-ins; query `systemctl show -P ExecStart` instead if those ever matter.
 warn_if_exec_start_lacks() {
-    local unit=$1 flag=$2 dropins
+    local unit=$1 dropins patterns=() wanted flag
+    shift
+    for flag in "$@"; do
+        patterns+=(-e "$flag")
+    done
+    printf -v wanted '%s or ' "$@"
+    wanted=${wanted% or }
     # systemd sorts drop-ins bytewise, not by the caller's locale.
     local LC_ALL=C
     shopt -s nullglob
@@ -444,8 +461,8 @@ warn_if_exec_start_lacks() {
         /\\$/ { joined = joined substr($0, 1, length($0) - 1) " "; next }
         { joined = joined $0; if (in_service && joined ~ /^[[:space:]]*ExecStart[[:space:]]*=/) last = joined; joined = "" }
         END { print last }
-    ' "$unit" "${dropins[@]}" | grep -Fq -- "$flag" \
-        || printf '%s\n' "warning: the ExecStart from $unit and its drop-ins lacks $flag, so the service will not start; re-run with MECFEEDMCP_FORCE_UNIT=1 or fix the unit and its drop-ins in $unit.d" >&2
+    ' "$unit" "${dropins[@]}" | grep -Fq "${patterns[@]}" \
+        || printf '%s\n' "warning: the ExecStart from $unit and its drop-ins lacks $wanted, so the service will not start; re-run with MECFEEDMCP_FORCE_UNIT=1 or fix the unit and its drop-ins in $unit.d" >&2
 }
 
 if [[ -e "$unit_path" ]] && ! cmp -s "$unit_path" "$package_dir/packaging/systemd/mecfeedmcp.service" && [[ "$force_unit" != 1 ]]; then
@@ -461,6 +478,7 @@ else
     install -m 0644 "$package_dir/packaging/systemd/mecfeed-serve.service" "$serve_unit_path"
 fi
 warn_if_exec_start_lacks "$serve_unit_path" --trusted-snapshot-key
+warn_if_exec_start_lacks "$serve_unit_path" --clients-file --allow-anonymous-feeds
 if (( live_install )) && [[ "$skip_reload" != 1 ]]; then
     systemctl daemon-reload
 fi
@@ -561,4 +579,5 @@ printf '%s\n' \
     '3. Mint a least-privilege token as root, then start mecfeedmcp manually after configuration.' \
     '4. Configure remote journal forwarding before handling production traffic.' \
     "5. Snapshot signing public key (copy $signing_pub_path to any mecfeed-serve on another host): $signing_public_key" \
+    '6. Add feed clients: mecfeed-serve --generate-basic-password prints a password (give it to the firewall) and its basic_sha256 (put it in /etc/mecfeed-serve/clients.json with the feeds that client may pull), then restart mecfeed-serve. Until then every feed answers 401.' \
     'MCP endpoint: http://127.0.0.1:30040/mcp'
