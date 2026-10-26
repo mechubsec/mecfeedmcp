@@ -1,8 +1,8 @@
 # Operations
 
 > 🚧 **Under construction.** The MCP server publishes an approved snapshot
-> and can read MISP. `mecfeed-serve` serves verified snapshots; auth, abuse
-> limits, and the security review are not done. Do not deploy it.
+> and can read MISP. `mecfeed-serve` serves verified snapshots with client
+> authentication; abuse limits and the security review are not done. Do not deploy it.
 
 The shared `mecmcp` crates are pinned — to `v0.28.1`.
 
@@ -20,6 +20,7 @@ The shared `mecmcp` crates are pinned — to `v0.28.1`.
 | `/var/lib/mecfeed-snapshots` | snapshots: written by the MCP server, read by mecfeed-serve (mecfeedmcp:mecfeed-serve, setgid 2750) |
 | `/etc/mecfeed-serve/tls.crt`, `tls.key` | feed-server TLS material |
 | `/etc/mecfeed-serve/snapshot-signing.pub` | trusted snapshot public key (`0644 root`) |
+| `/etc/mecfeed-serve/clients.json` | client list (`0640 root:root`, read through `LoadCredential`) |
 
 The installer never enables either unit. Create config and credentials first,
 then `systemctl enable --now mecfeedmcp.service` (and `mecfeed-serve.service`
@@ -44,7 +45,7 @@ loopback-only allowlist rejects every client. Use host networking, or pass
 verified snapshot and answers 503 when the snapshot log does not verify.
 Formats: `panos-edl`, `junos-dynamic-address`, `fortigate-threat-feed`,
 `opnsense-url-table`. Kinds: `address`, `prefix`, `domain` (Junos has no
-`domain`). Everything else is 404.
+`domain`). A feed path without valid credentials gets 401; every other path is 404.
 
 `mecfeed-serve` requires `--feed-config` (the MCP server's `feed.json`). It reads
 the operator allowlists at startup and applies them to the current snapshot on
@@ -97,7 +98,10 @@ chmod 0644 snapshot-signing.pub
 
 ```sh
 -v "$PWD/snapshot-signing.pub:/etc/mecfeed-serve/snapshot-signing.pub:ro"
+-v "$PWD/clients.json:/etc/mecfeed-serve/clients.json:ro"
 ```
+
+`clients.json` is the client list (see "Client authentication").
 
 Rotation (systemd). Each step that changes a unit ends with
 `systemctl daemon-reload` and a restart; restart alone keeps the cached unit.
@@ -170,7 +174,7 @@ loopback only).
 4. Publish one version.
 5. Replace the mounted `snapshot-signing.pub` with `next.pub` (`0644`) and
    recreate serve with the same arguments as before (`--listen`, each
-   `--allow-cidr`), without the extra mount and `--trusted-snapshot-key`. Then
+   `--allow-cidr`, and `--client-ca` when it is used), without the extra mount and `--trusted-snapshot-key`. Then
    `sudo rm -r next`.
 
 Upgrading from an unsigned release (systemd/LXC):
@@ -202,6 +206,90 @@ publish, because it refuses the current version.
 
 Serve verifies once per `current` change and serves from memory. A `.sig`
 changed after that is noticed at the next publish or serve restart.
+
+## Client authentication
+
+Every feed request needs a client listed in `--clients-file`. A request with no
+or wrong credentials gets 401. A listed client asking for a feed not in its
+`feeds` list gets 403. `/healthz` is open to the CIDR allowlist and needs no
+credentials. `--allow-cidr` still runs first. Serve needs exactly one of
+`--clients-file` and `--allow-anonymous-feeds`, the explicit opt-out to
+CIDR-only access. `--client-ca` is refused with `--allow-anonymous-feeds`. The
+Docker image always passes `--clients-file`, so anonymous mode there needs
+`--entrypoint /usr/local/bin/mecfeed-serve` followed by the image's full
+argument list from `Dockerfile.serve` (including `--listen 0.0.0.0:8443`,
+because Docker clears CMD when `--entrypoint` is set), with `--allow-anonymous-feeds` in place
+of `--clients-file <path>`.
+
+The file:
+
+```json
+{"version": 1, "clients": [
+  {"name": "panosvm", "basic_sha256": "<64 lowercase hex>", "feeds": ["panos-edl/address", "panos-edl/domain"]},
+  {"name": "vsrx-ci", "cert_sha256": "<64 lowercase hex>", "feeds": ["junos-dynamic-address/address"]}
+]}
+```
+
+Rules, all checked at startup:
+
+- `name` matches `[A-Za-z0-9._-]{1,64}` and is unique. It is the Basic username.
+- `basic_sha256` and `cert_sha256` are each exactly 64 lowercase hex characters.
+  A client needs at least one. A `cert_sha256` is unique across clients.
+- `feeds` is non-empty with no duplicates. Each entry is `<format>/<kind>` from
+  the formats and kinds above, so `junos-dynamic-address/domain` is refused.
+- Unknown fields are refused, and `version` must be `1`.
+- An empty `clients` list is valid and closes every feed (all answer 401).
+- The file is at most 1 MiB, and must be a regular file, not a symlink.
+
+Add a Basic client:
+
+1. Run `mecfeed-serve --generate-basic-password`. Stdout is the password: give
+   it to the firewall. Stderr is `basic_sha256: <hex>`: put that in the file.
+   The password is shown once and never stored.
+2. Add the client to `clients.json`, then `systemctl restart mecfeed-serve`.
+
+PAN-OS EDL. The source URL is `https://<serve host>:8443/feeds/panos-edl/<kind>`.
+The certificate profile must trust the CA that signed serve's TLS certificate.
+Client authentication takes the client's name and password. The option appears
+only for an HTTPS source that has a certificate profile.
+
+SRX Basic (Junos 25.2R1+). Set `user-name` and `password` under the feed
+server, with the URL
+`https://<serve host>:8443/feeds/junos-dynamic-address/<kind>`.
+
+SRX mTLS:
+
+1. Issue the SRX a client certificate from a client CA, with the clientAuth
+   EKU or no EKU (a serverAuth-only certificate is rejected).
+2. Start serve with `--client-ca <ca.pem>`. With systemd, put the CA at
+   `/etc/mecfeed-serve/client-ca.pem` (`0644 root`), copy the current
+   `ExecStart` into a drop-in and add the flag, then `systemctl daemon-reload`
+   and restart. With Docker, mount the CA readable by uid 65532
+   (`-v "$PWD/client-ca.pem:/etc/mecfeed-serve/client-ca.pem:ro"`) and pass
+   `--client-ca /etc/mecfeed-serve/client-ca.pem` after the image name,
+   re-passing `--listen` and every `--allow-cidr`. `--client-ca` is
+   required whenever a client has `cert_sha256`.
+3. Pin the certificate: run `mecfeed-serve --print-cert-fingerprint <srx-cert.pem>`
+   and put the output in the client's `cert_sha256`.
+4. On the SRX, reference the local certificate in the SSL initiation profile.
+
+Rotation. Edit the file and restart serve. A new Basic password needs a new
+hash. Renewing a certificate changes its fingerprint, so update `cert_sha256`
+too.
+
+Upgrading (systemd/LXC):
+
+1. Re-run the installer with `MECFEEDMCP_FORCE_UNIT=1`. It writes the starter
+   list `{"version":1,"clients":[]}` (`0640 root:root`) if the file is absent.
+2. Add the clients.
+3. `systemctl daemon-reload && systemctl restart mecfeed-serve`
+4. Set credentials on each firewall.
+
+Until step 2, every feed answers 401.
+
+Upgrading (Docker): create `clients.json`, readable by uid 65532 (`0644` is
+fine: it holds only hashes of 32-byte secrets and fingerprints). Mount it at
+`/etc/mecfeed-serve/clients.json:ro` and recreate the serve container.
 
 ## Tokens and audit
 

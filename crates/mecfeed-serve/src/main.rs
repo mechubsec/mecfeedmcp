@@ -4,7 +4,9 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod clients;
 mod snapshots;
+mod tls;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -16,13 +18,14 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
+use base64::Engine;
 use clap::Parser;
+use clients::{Clients, Denial};
 use ipnet::IpNet;
 use mecfeedmcp_core::{
     FeedFormat, IndicatorKind, Limits, Policy, PublicKey, TrustedKeys, render_feed,
 };
-use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use serde::{Deserialize, de::IgnoredAny};
 use sha2::{Digest, Sha256};
 use snapshots::Loaded;
@@ -42,30 +45,54 @@ struct Args {
     listen: SocketAddr,
 
     /// PEM certificate chain (leaf first).
-    #[arg(long)]
-    tls_cert: PathBuf,
+    #[arg(long, required_unless_present_any = ["generate_basic_password", "print_cert_fingerprint"])]
+    tls_cert: Option<PathBuf>,
 
     /// PEM private key.
-    #[arg(long)]
-    tls_key: PathBuf,
+    #[arg(long, required_unless_present_any = ["generate_basic_password", "print_cert_fingerprint"])]
+    tls_key: Option<PathBuf>,
 
     /// Operator feed.json. Its prefix and domain allowlists are re-applied to
     /// every published version before it is verified and before each render.
-    #[arg(long)]
-    feed_config: PathBuf,
+    #[arg(long, required_unless_present_any = ["generate_basic_password", "print_cert_fingerprint"])]
+    feed_config: Option<PathBuf>,
 
     /// Directory of versioned snapshots; the current one must carry a trusted signature. May be empty.
-    #[arg(long)]
-    snapshot_dir: PathBuf,
+    #[arg(long, required_unless_present_any = ["generate_basic_password", "print_cert_fingerprint"])]
+    snapshot_dir: Option<PathBuf>,
 
     /// Public key trusted to sign snapshots: a file holding one base64 Ed25519 key.
     /// Repeatable; at least one is required.
-    #[arg(long = "trusted-snapshot-key", required = true)]
+    #[arg(long = "trusted-snapshot-key", required_unless_present_any = ["generate_basic_password", "print_cert_fingerprint"])]
     trusted_snapshot_key: Vec<PathBuf>,
 
     /// Client IP/CIDR allowlist. Repeatable. Empty means loopback only.
     #[arg(long = "allow-cidr")]
     allow_cidr: Vec<IpNet>,
+
+    /// Feed client list (JSON). Every feed request must come from a listed client.
+    #[arg(
+        long,
+        conflicts_with = "allow_anonymous_feeds",
+        required_unless_present_any = ["allow_anonymous_feeds", "generate_basic_password", "print_cert_fingerprint"]
+    )]
+    clients_file: Option<PathBuf>,
+
+    /// Serve feeds to any client the CIDR allowlist admits, without client authentication.
+    #[arg(long)]
+    allow_anonymous_feeds: bool,
+
+    /// PEM CA certificates that sign client certificates. Required when a client has `cert_sha256`.
+    #[arg(long, value_name = "PEM", conflicts_with = "allow_anonymous_feeds")]
+    client_ca: Option<PathBuf>,
+
+    /// Print a new Basic password on stdout and its `basic_sha256` on stderr, then exit.
+    #[arg(long, conflicts_with = "print_cert_fingerprint")]
+    generate_basic_password: bool,
+
+    /// Print the SHA-256 of the first certificate in a PEM file (for `cert_sha256`), then exit.
+    #[arg(long, value_name = "PEM")]
+    print_cert_fingerprint: Option<PathBuf>,
 }
 
 /// The slice of feed.json that serve needs. MCP-only keys are accepted but not
@@ -154,6 +181,8 @@ struct App {
     policy: Policy,
     /// Keys the current snapshot's signature must verify against.
     trusted: TrustedKeys,
+    /// Feed clients; `None` when `--allow-anonymous-feeds` was given.
+    clients: Option<Arc<Clients>>,
     /// Serializes reloads so an older load can never overwrite a newer one.
     reload: Arc<tokio::sync::Mutex<()>>,
     /// Last fully verified load. Readers only ever see a complete, verified set.
@@ -170,22 +199,59 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    if !args.snapshot_dir.is_dir() {
+    let provider = rustls::crypto::ring::default_provider();
+    if args.generate_basic_password {
+        let (password, digest) = generate_basic_password(provider.secure_random)?;
+        println!("{password}");
+        eprintln!("basic_sha256: {digest}");
+        return Ok(());
+    }
+    if let Some(path) = &args.print_cert_fingerprint {
+        println!("{}", cert_fingerprint(path)?);
+        return Ok(());
+    }
+    let (Some(tls_cert), Some(tls_key), Some(feed_config), Some(snapshot_dir)) = (
+        args.tls_cert.clone(),
+        args.tls_key.clone(),
+        args.feed_config.clone(),
+        args.snapshot_dir.clone(),
+    ) else {
+        anyhow::bail!("--tls-cert, --tls-key, --feed-config and --snapshot-dir are required");
+    };
+    if !snapshot_dir.is_dir() {
         anyhow::bail!(
             "snapshot directory {} is missing or not a directory",
-            args.snapshot_dir.display()
+            snapshot_dir.display()
         );
     }
 
-    let provider = rustls::crypto::ring::default_provider();
     provider
         .clone()
         .install_default()
         .map_err(|_| anyhow::anyhow!("failed to install the rustls ring crypto provider"))?;
 
-    let policy = load_policy(&args.feed_config)?;
+    let policy = load_policy(&feed_config)?;
     let trusted = load_trusted_keys(&args.trusted_snapshot_key)?;
-    let tls = load_tls(&args.tls_cert, &args.tls_key, Arc::new(provider))?;
+    // clap enforces this too; this is the fail-closed backstop.
+    let clients = match (&args.clients_file, args.allow_anonymous_feeds) {
+        (Some(path), _) => Some(Arc::new(clients::load(path)?)),
+        (None, false) => {
+            anyhow::bail!("--clients-file is required unless --allow-anonymous-feeds is set")
+        }
+        (None, true) => {
+            tracing::warn!(
+                "--allow-anonymous-feeds: feeds are served without client authentication"
+            );
+            None
+        }
+    };
+    check_client_ca(clients.as_deref(), args.client_ca.as_deref())?;
+    let tls = tls::server_config(
+        &tls_cert,
+        &tls_key,
+        args.client_ca.as_deref(),
+        Arc::new(provider),
+    )?;
     let allow = if args.allow_cidr.is_empty() {
         vec![
             "127.0.0.0/8"
@@ -200,48 +266,54 @@ async fn main() -> Result<()> {
     };
 
     let app = App {
-        snapshot_dir: args.snapshot_dir,
+        snapshot_dir,
         allow,
         policy,
         trusted,
+        clients,
         reload: Arc::default(),
         cache: Arc::default(),
     };
     let router = router(app);
 
     tracing::info!(listen = %args.listen, "mecfeed-serve listening (TLS only)");
-    axum_server::bind_rustls(
-        args.listen,
-        axum_server::tls_rustls::RustlsConfig::from_config(tls),
-    )
-    .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-    .await
-    .context("feed server exited")?;
+    axum_server::bind(args.listen)
+        .acceptor(tls::PeerCertAcceptor::new(
+            axum_server::tls_rustls::RustlsConfig::from_config(tls),
+        ))
+        .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .context("feed server exited")?;
     Ok(())
 }
 
-fn load_tls(
-    cert_path: &std::path::Path,
-    key_path: &std::path::Path,
-    provider: Arc<rustls::crypto::CryptoProvider>,
-) -> Result<Arc<ServerConfig>> {
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
-        .with_context(|| format!("reading TLS cert {}", cert_path.display()))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("parsing TLS cert {}", cert_path.display()))?;
-    if certs.is_empty() {
-        anyhow::bail!("TLS cert file contained no certificates");
+/// Refuse certificate clients without a CA to verify their chains.
+fn check_client_ca(clients: Option<&Clients>, client_ca: Option<&std::path::Path>) -> Result<()> {
+    if clients.is_some_and(Clients::needs_client_ca) && client_ca.is_none() {
+        anyhow::bail!("the client list has certificate clients; --client-ca is required");
     }
-    let key = PrivateKeyDer::from_pem_file(key_path)
-        .with_context(|| format!("reading TLS key {}", key_path.display()))?;
-    let mut config = ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .context("selecting TLS protocol versions")?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("building rustls server config")?;
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(Arc::new(config))
+    Ok(())
+}
+
+/// A new Basic password (32 random bytes, base64url without padding) and its `basic_sha256`.
+fn generate_basic_password(random: &dyn rustls::crypto::SecureRandom) -> Result<(String, String)> {
+    let mut bytes = [0u8; 32];
+    random
+        .fill(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("no secure random source"))?;
+    let password = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let digest = hex(&Sha256::digest(password.as_bytes()));
+    Ok((password, digest))
+}
+
+/// SHA-256 of the first certificate in a PEM file, as lowercase hex.
+fn cert_fingerprint(path: &std::path::Path) -> Result<String> {
+    let cert = CertificateDer::pem_file_iter(path)
+        .with_context(|| format!("reading certificate {}", path.display()))?
+        .next()
+        .with_context(|| format!("{} holds no certificate", path.display()))?
+        .with_context(|| format!("parsing certificate {}", path.display()))?;
+    Ok(hex(&Sha256::digest(cert.as_ref())))
 }
 
 fn client_allowed(allow: &[IpNet], addr: SocketAddr) -> bool {
@@ -269,10 +341,61 @@ async fn require_allowed_client(
     next.run(request).await
 }
 
+/// `WWW-Authenticate` value on every 401.
+const BASIC_CHALLENGE: &str = "Basic realm=\"mecfeed\", charset=\"UTF-8\"";
+
+/// Feed-route client authentication. Runs before the format and kind are parsed,
+/// so an unauthenticated caller learns nothing about which feeds exist.
+async fn require_client(
+    State(app): State<App>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path((format, kind)): Path<(String, String)>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(clients) = &app.clients else {
+        return next.run(request).await;
+    };
+    let feed = format!("{format}/{kind}");
+    let peer = request
+        .extensions()
+        .get::<tls::PeerCert>()
+        .and_then(|peer| peer.0);
+    match clients.authorize(
+        peer.as_ref(),
+        request.headers().get(header::AUTHORIZATION),
+        &feed,
+    ) {
+        Ok(_) => next.run(request).await,
+        Err(denial) => {
+            tracing::info!(
+                client_ip = %addr.ip(),
+                client = denial.client().unwrap_or(""),
+                reason = denial.reason(),
+                "feed request denied"
+            );
+            if matches!(denial, Denial::FeedNotAllowed { .. }) {
+                StatusCode::FORBIDDEN.into_response()
+            } else {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    [(
+                        header::WWW_AUTHENTICATE,
+                        HeaderValue::from_static(BASIC_CHALLENGE),
+                    )],
+                )
+                    .into_response()
+            }
+        }
+    }
+}
+
 fn router(app: App) -> Router {
     Router::new()
-        .route("/healthz", any(healthz))
         .route("/feeds/{format}/{kind}", any(feed))
+        // Only the feed route above is covered; routes added after it are not.
+        .route_layer(middleware::from_fn_with_state(app.clone(), require_client))
+        .route("/healthz", any(healthz))
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(middleware::from_fn_with_state(
             app.clone(),
@@ -466,12 +589,18 @@ mod tests {
         FeedVersions, IndicatorKind, Limits, Policy, Proposal, ProposedEntry, PublicKey,
         TrustedKeys, encode_signature_file, signed_message,
     };
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
+        KeyPair,
+    };
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
     use sha2::{Digest, Sha256};
     use std::{
         net::{IpAddr, SocketAddr},
         path::Path,
         time::{SystemTime, UNIX_EPOCH},
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
 
     const DAY: i64 = 86_400;
@@ -603,10 +732,326 @@ mod tests {
             allow: vec!["127.0.0.0/8".parse().expect("loopback")],
             policy,
             trusted: keys,
+            clients: None,
             reload: std::sync::Arc::default(),
             cache: std::sync::Arc::default(),
         })
         .layer(MockConnectInfo(SocketAddr::from((peer, 1))))
+    }
+
+    const PANOS_PASSWORD: &str = "s3cret-password";
+
+    #[test]
+    fn helpers_parse_without_serving_flags() {
+        use clap::Parser;
+        assert!(
+            super::Args::try_parse_from(["mecfeed-serve", "--generate-basic-password"]).is_ok()
+        );
+        assert!(
+            super::Args::try_parse_from(["mecfeed-serve", "--print-cert-fingerprint", "c.pem"])
+                .is_ok()
+        );
+        assert!(
+            super::Args::try_parse_from([
+                "mecfeed-serve",
+                "--generate-basic-password",
+                "--print-cert-fingerprint",
+                "c.pem"
+            ])
+            .is_err()
+        );
+        assert!(super::Args::try_parse_from(["mecfeed-serve"]).is_err());
+    }
+
+    #[test]
+    fn client_ca_conflicts_with_anonymous_mode() {
+        use clap::Parser;
+        assert!(
+            super::Args::try_parse_from([
+                "mecfeed-serve",
+                "--tls-cert",
+                "c",
+                "--tls-key",
+                "k",
+                "--feed-config",
+                "f",
+                "--snapshot-dir",
+                "d",
+                "--trusted-snapshot-key",
+                "p",
+                "--allow-anonymous-feeds",
+                "--client-ca",
+                "ca.pem",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_certificate_client_needs_client_ca() {
+        let json = format!(
+            r#"{{"version":1,"clients":[{{"name":"vsrx-ci","cert_sha256":"{}","feeds":["junos-dynamic-address/address"]}}]}}"#,
+            "ab".repeat(32)
+        );
+        let clients = crate::clients::Clients::from_json(json.as_bytes()).expect("clients");
+        let error = super::check_client_ca(Some(&clients), None).expect_err("refused");
+        assert!(format!("{error:#}").contains("--client-ca"));
+        super::check_client_ca(Some(&clients), Some(Path::new("ca.pem"))).expect("ok with CA");
+        super::check_client_ca(Some(&panos_clients()), None).expect("basic-only needs no CA");
+        super::check_client_ca(None, None).expect("anonymous");
+    }
+
+    #[test]
+    fn generated_password_matches_its_hash() {
+        let random = rustls::crypto::ring::default_provider().secure_random;
+        let (password, digest) = super::generate_basic_password(random).expect("password");
+        assert_eq!(password.len(), 43);
+        assert!(
+            password
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        );
+        assert_eq!(digest, hex(&Sha256::digest(password.as_bytes())));
+        let (other, _) = super::generate_basic_password(random).expect("password");
+        assert_ne!(password, other);
+    }
+
+    #[test]
+    fn cert_fingerprint_is_the_sha256_of_the_first_der() {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let cert = rcgen::CertificateParams::new(vec!["vsrx-ci".to_string()])
+            .expect("params")
+            .self_signed(&key)
+            .expect("cert");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("client.pem");
+        std::fs::write(&path, cert.pem()).expect("write pem");
+        assert_eq!(
+            super::cert_fingerprint(&path).expect("fingerprint"),
+            hex(&Sha256::digest(cert.der()))
+        );
+        std::fs::write(&path, "not a pem").expect("write");
+        assert!(super::cert_fingerprint(&path).is_err());
+    }
+
+    fn panos_clients() -> crate::clients::Clients {
+        let json = format!(
+            r#"{{"version":1,"clients":[{{"name":"panosvm","basic_sha256":"{}","feeds":["panos-edl/address"]}}]}}"#,
+            hex(&Sha256::digest(PANOS_PASSWORD.as_bytes()))
+        );
+        crate::clients::Clients::from_json(json.as_bytes()).expect("clients")
+    }
+
+    fn app_with_clients(dir: &Path) -> axum::Router {
+        router(App {
+            snapshot_dir: dir.to_path_buf(),
+            allow: vec!["127.0.0.0/8".parse().expect("loopback")],
+            policy: empty_policy(),
+            trusted: trusted(&[&test_key(1)]),
+            clients: Some(std::sync::Arc::new(panos_clients())),
+            reload: std::sync::Arc::default(),
+            cache: std::sync::Arc::default(),
+        })
+        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))))
+    }
+
+    fn basic_header(user: &str, password: &str) -> String {
+        format!(
+            "Basic {}",
+            BASE64_STANDARD.encode(format!("{user}:{password}"))
+        )
+    }
+
+    async fn send_as(
+        app: &axum::Router,
+        method: Method,
+        uri: &str,
+        authorization: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(value) = authorization {
+            request = request.header(header::AUTHORIZATION, value);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).expect("request"))
+            .await
+            .expect("response");
+        let (parts, body) = response.into_parts();
+        let bytes = to_bytes(body, usize::MAX).await.expect("body");
+        (parts.status, parts.headers, bytes.to_vec())
+    }
+
+    #[tokio::test]
+    async fn path_variants_never_serve_without_credentials() {
+        let dir = one_version_dir();
+        let app = app_with_clients(dir.path());
+        // 404 where the route shape does not match; 401 where it does. Never 200.
+        let cases = [
+            ("/feeds/panos-edl/address/", StatusCode::NOT_FOUND),
+            ("/feeds//panos-edl/address", StatusCode::NOT_FOUND),
+            ("/feeds/panos-edl%2Faddress", StatusCode::NOT_FOUND),
+            ("/feeds/PANOS-EDL/address", StatusCode::UNAUTHORIZED),
+            ("/FEEDS/panos-edl/address", StatusCode::NOT_FOUND),
+            ("/feeds/panos-edl/address?x=1", StatusCode::UNAUTHORIZED),
+            ("/feeds/panos-edl/%61ddress", StatusCode::UNAUTHORIZED),
+        ];
+        for (uri, want) in cases {
+            let (status, _, _) = send_as(&app, Method::GET, uri, None).await;
+            assert_eq!(status, want, "{uri}");
+        }
+        // `%61ddress` decodes to `address`: authorization and the handler agree on it.
+        let good = basic_header("panosvm", PANOS_PASSWORD);
+        let (status, _, _) =
+            send_as(&app, Method::GET, "/feeds/panos-edl/%61ddress", Some(&good)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn feeds_need_a_listed_client_and_unknown_paths_do_not_leak() {
+        let dir = one_version_dir();
+        let app = app_with_clients(dir.path());
+        for uri in ["/feeds/panos-edl/address", "/feeds/nope/nothing"] {
+            for method in [Method::GET, Method::HEAD] {
+                let (status, headers, body) = send_as(&app, method, uri, None).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+                assert_eq!(
+                    headers.get(header::WWW_AUTHENTICATE).expect("challenge"),
+                    "Basic realm=\"mecfeed\", charset=\"UTF-8\""
+                );
+                assert!(body.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_password_and_unknown_user_are_401() {
+        let dir = one_version_dir();
+        let app = app_with_clients(dir.path());
+        for header_value in [
+            basic_header("panosvm", "wrong"),
+            basic_header("nobody", PANOS_PASSWORD),
+        ] {
+            let (status, _, body) = send_as(
+                &app,
+                Method::GET,
+                "/feeds/panos-edl/address",
+                Some(&header_value),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert!(body.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listed_client_gets_its_feed_and_403_elsewhere() {
+        let dir = one_version_dir();
+        let good = basic_header("panosvm", PANOS_PASSWORD);
+        let app = app_with_clients(dir.path());
+        let (status, headers, body) =
+            send_as(&app, Method::GET, "/feeds/panos-edl/address", Some(&good)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, anonymous_headers, anonymous_body) = send(
+            &app_for_peer(dir.path(), [127, 0, 0, 1]),
+            Method::GET,
+            "/feeds/panos-edl/address",
+            None,
+        )
+        .await;
+        assert_eq!(body, anonymous_body);
+        assert_eq!(
+            headers.get(header::ETAG),
+            anonymous_headers.get(header::ETAG)
+        );
+        let (status, _, body) =
+            send_as(&app, Method::GET, "/feeds/panos-edl/domain", Some(&good)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn healthz_needs_no_client() {
+        let dir = one_version_dir();
+        let (status, _, _) =
+            send_as(&app_with_clients(dir.path()), Method::GET, "/healthz", None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_denied_request_never_logs_the_password() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        // Global, not scoped: a scoped default races other tests' callsite registration and flakes.
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("only this test installs a subscriber");
+        let dir = one_version_dir();
+        let wrong = basic_header("panosvm", "wrong-password-value");
+        let (status, headers, body) = send_as(
+            &app_with_clients(dir.path()),
+            Method::GET,
+            "/feeds/panos-edl/address",
+            Some(&wrong),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let logs = String::from_utf8(captured.0.lock().expect("log buffer").clone()).expect("utf8");
+        assert!(logs.contains("bad-password"), "{logs}");
+        for haystack in [
+            logs.as_str(),
+            &format!("{headers:?}"),
+            &String::from_utf8_lossy(&body),
+        ] {
+            assert!(!haystack.contains("wrong-password-value"));
+            assert!(!haystack.contains(&wrong));
+        }
+    }
+
+    #[test]
+    fn exactly_one_client_mode_is_required() {
+        use clap::Parser;
+        let base = [
+            "mecfeed-serve",
+            "--tls-cert",
+            "c",
+            "--tls-key",
+            "k",
+            "--feed-config",
+            "f",
+            "--snapshot-dir",
+            "d",
+            "--trusted-snapshot-key",
+            "p",
+        ];
+        assert!(super::Args::try_parse_from(base).is_err());
+        assert!(
+            super::Args::try_parse_from(base.iter().chain(&["--allow-anonymous-feeds"])).is_ok()
+        );
+        assert!(super::Args::try_parse_from(base.iter().chain(&["--clients-file", "x"])).is_ok());
+        assert!(
+            super::Args::try_parse_from(base.iter().chain(&[
+                "--clients-file",
+                "x",
+                "--allow-anonymous-feeds"
+            ]))
+            .is_err()
+        );
     }
 
     fn two_version_dir() -> tempfile::TempDir {
@@ -1127,5 +1572,188 @@ mod tests {
     fn crate_version_is_nonempty() {
         assert!(!env!("CARGO_PKG_VERSION").is_empty());
         assert!(!mecfeedmcp_core::version().is_empty());
+    }
+
+    struct Pki {
+        ca: CertifiedIssuer<'static, KeyPair>,
+    }
+
+    impl Pki {
+        fn new() -> Self {
+            let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            Self {
+                ca: CertifiedIssuer::self_signed(params, KeyPair::generate().expect("key"))
+                    .expect("ca"),
+            }
+        }
+
+        /// A leaf for `name`: (cert DER, key DER, cert PEM, key PEM).
+        fn leaf(
+            &self,
+            name: &str,
+            usage: ExtendedKeyUsagePurpose,
+        ) -> (
+            CertificateDer<'static>,
+            PrivateKeyDer<'static>,
+            String,
+            String,
+        ) {
+            let mut params = CertificateParams::new(vec![name.to_string()]).expect("params");
+            params.extended_key_usages = vec![usage];
+            let key = KeyPair::generate().expect("key");
+            let cert = params.signed_by(&key, &self.ca).expect("leaf");
+            (
+                cert.der().clone(),
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+                cert.pem(),
+                key.serialize_pem(),
+            )
+        }
+    }
+
+    /// Serve the real router over TLS with `--client-ca` set to `pki`'s CA.
+    async fn start_tls(dir: &Path, pki: &Pki, clients_json: &str) -> SocketAddr {
+        let files = tempfile::tempdir().expect("tls files");
+        let (_, _, cert_pem, key_pem) = pki.leaf("localhost", ExtendedKeyUsagePurpose::ServerAuth);
+        let (cert_path, key_path, ca_path) = (
+            files.path().join("tls.crt"),
+            files.path().join("tls.key"),
+            files.path().join("client-ca.pem"),
+        );
+        std::fs::write(&cert_path, cert_pem).expect("cert");
+        std::fs::write(&key_path, key_pem).expect("key");
+        std::fs::write(&ca_path, pki.ca.pem()).expect("ca");
+        let config = crate::tls::server_config(
+            &cert_path,
+            &key_path,
+            Some(&ca_path),
+            std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .expect("server config");
+        let app = App {
+            snapshot_dir: dir.to_path_buf(),
+            allow: vec!["127.0.0.0/8".parse().expect("loopback")],
+            policy: empty_policy(),
+            trusted: trusted(&[&test_key(1)]),
+            clients: Some(std::sync::Arc::new(
+                crate::clients::Clients::from_json(clients_json.as_bytes()).expect("clients"),
+            )),
+            reload: std::sync::Arc::default(),
+            cache: std::sync::Arc::default(),
+        };
+        let handle = axum_server::Handle::new();
+        let server = axum_server::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .handle(handle.clone())
+            .acceptor(crate::tls::PeerCertAcceptor::new(
+                axum_server::tls_rustls::RustlsConfig::from_config(config),
+            ));
+        tokio::spawn(server.serve(router(app).into_make_service_with_connect_info::<SocketAddr>()));
+        handle.listening().await.expect("bound")
+    }
+
+    /// GET the panos-edl address feed over TLS; returns the raw response.
+    async fn tls_get(
+        addr: SocketAddr,
+        pki: &Pki,
+        client: Option<(CertificateDer<'static>, PrivateKeyDer<'static>)>,
+        authorization: Option<String>,
+    ) -> std::io::Result<String> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(pki.ca.der().clone()).expect("root");
+        let builder = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("versions")
+        .with_root_certificates(roots);
+        let config = match client {
+            Some((cert, key)) => builder
+                .with_client_auth_cert(vec![cert], key)
+                .expect("client cert"),
+            None => builder.with_no_client_auth(),
+        };
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        let mut tls = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+            .connect(ServerName::try_from("localhost").expect("name"), tcp)
+            .await?;
+        let mut request = String::from(
+            "GET /feeds/panos-edl/address HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n",
+        );
+        if let Some(value) = authorization {
+            request.push_str(&format!("Authorization: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        tls.write_all(request.as_bytes()).await?;
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await?;
+        Ok(String::from_utf8_lossy(&response).into_owned())
+    }
+
+    fn tls_clients(pinned: &CertificateDer<'_>) -> String {
+        format!(
+            r#"{{"version":1,"clients":[
+                {{"name":"vsrx-ci","cert_sha256":"{}","feeds":["panos-edl/address"]}},
+                {{"name":"panosvm","basic_sha256":"{}","feeds":["panos-edl/address"]}}
+            ]}}"#,
+            hex(&Sha256::digest(pinned.as_ref())),
+            hex(&Sha256::digest(b"pw")),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_pinned_client_certificate_gets_the_feed() {
+        let dir = one_version_dir();
+        let pki = Pki::new();
+        let (cert, key, _, _) = pki.leaf("vsrx-ci", ExtendedKeyUsagePurpose::ClientAuth);
+        let addr = start_tls(dir.path(), &pki, &tls_clients(&cert)).await;
+        let response = tls_get(addr, &pki, Some((cert, key)), None)
+            .await
+            .expect("response");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_ca_signed_but_unlisted_certificate_is_401() {
+        let dir = one_version_dir();
+        let pki = Pki::new();
+        let (pinned, _, _, _) = pki.leaf("vsrx-ci", ExtendedKeyUsagePurpose::ClientAuth);
+        let (other, other_key, _, _) = pki.leaf("other", ExtendedKeyUsagePurpose::ClientAuth);
+        let addr = start_tls(dir.path(), &pki, &tls_clients(&pinned)).await;
+        let response = tls_get(addr, &pki, Some((other, other_key)), None)
+            .await
+            .expect("response");
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_certificate_from_another_ca_fails_the_handshake() {
+        let dir = one_version_dir();
+        let pki = Pki::new();
+        let (pinned, pinned_key, _, _) = pki.leaf("vsrx-ci", ExtendedKeyUsagePurpose::ClientAuth);
+        let foreign = Pki::new();
+        let (cert, key, _, _) = foreign.leaf("vsrx-ci", ExtendedKeyUsagePurpose::ClientAuth);
+        let addr = start_tls(dir.path(), &pki, &tls_clients(&pinned)).await;
+        // The same listener serves the pinned certificate, so the refusal below is the CA.
+        let accepted = tls_get(addr, &pki, Some((pinned, pinned_key)), None)
+            .await
+            .expect("pinned certificate response");
+        assert!(accepted.starts_with("HTTP/1.1 200"), "{accepted}");
+        // TLS 1.3 may report the rejection on the first read rather than at connect.
+        if let Ok(response) = tls_get(addr, &pki, Some((cert, key)), None).await {
+            assert!(!response.starts_with("HTTP/"), "{response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_certificate_with_good_basic_gets_the_feed() {
+        let dir = one_version_dir();
+        let pki = Pki::new();
+        let (pinned, _, _, _) = pki.leaf("vsrx-ci", ExtendedKeyUsagePurpose::ClientAuth);
+        let addr = start_tls(dir.path(), &pki, &tls_clients(&pinned)).await;
+        let response = tls_get(addr, &pki, None, Some(basic_header("panosvm", "pw")))
+            .await
+            .expect("response");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     }
 }

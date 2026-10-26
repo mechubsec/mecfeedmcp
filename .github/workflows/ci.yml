@@ -70,6 +70,7 @@ jobs:
           echo "$argv" | grep -q -- '/etc/mecfeed-serve/tls.key' || { echo "FAIL: --tls-key missing from argv"; exit 1; }
           echo "$argv" | grep -q -- '/var/lib/mecfeed-snapshots' || { echo "FAIL: --snapshot-dir missing from argv"; exit 1; }
           echo "$argv" | grep -q -- '/etc/mecfeed-serve/snapshot-signing.pub' || { echo "FAIL: --trusted-snapshot-key missing from argv"; exit 1; }
+          echo "$argv" | grep -q -- '/etc/mecfeed-serve/clients.json' || { echo "FAIL: --clients-file missing from argv"; exit 1; }
           echo "PASS: feed-server TLS paths survive --listen override"
       - name: Verify the audit HMAC key is generated on first run
         run: |

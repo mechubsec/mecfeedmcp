@@ -240,6 +240,16 @@ grep -Fq -- 'lacks --snapshot-signing-key-file' "$work_dir/stale-unit.err"
 stage_key="$stage_root/var/lib/mecfeedmcp/snapshot-signing.key"
 stage_pub="$stage_root/etc/mecfeed-serve/snapshot-signing.pub"
 [[ -f "$stage_key" && -f "$stage_pub" ]] || exit 1
+stage_clients="$stage_root/etc/mecfeed-serve/clients.json"
+[[ $(<"$stage_clients") == '{"version":1,"clients":[]}' ]] || { printf '%s\n' 'starter clients.json is wrong' >&2; exit 1; }
+[[ $(stat -c %a "$stage_clients") == 640 ]] || { printf '%s\n' 'starter clients.json is not 0640' >&2; exit 1; }
+if grep -Fq -- 'lacks --clients-file' "$work_dir/stale-unit.err"; then
+    printf '%s\n' 'installer warned about the packaged mecfeed-serve unit (clients)' >&2
+    exit 1
+fi
+# An operator's client list must survive a reinstall byte for byte.
+printf '%s\n' '{"version":1,"clients":[{"name":"x","basic_sha256":"'"$(printf '%064d' 0)"'","feeds":["panos-edl/address"]}]}' >"$stage_clients"
+sha256sum "$stage_clients" >"$work_dir/clients.sha256"
 signing_files=("$stage_key" "$stage_pub")
 sha256sum "${signing_files[@]}" >"$work_dir/signing.sha256"
 # The key exists now, so only --print runs; its stderr must still reach the operator.
@@ -247,6 +257,7 @@ stage_install >/dev/null 2>"$work_dir/reinstall.err"
 grep -Fq 'snapshot signing key id:' "$work_dir/reinstall.err"
 sha256sum -c "$work_dir/preserved.sha256" >/dev/null
 sha256sum -c "$work_dir/signing.sha256" >/dev/null
+sha256sum -c "$work_dir/clients.sha256" >/dev/null
 if grep -Fq -- 'lacks --trusted-snapshot-key' "$work_dir/stale-unit.err"; then
     printf '%s\n' 'installer warned about the packaged mecfeed-serve unit' >&2
     exit 1
@@ -269,6 +280,16 @@ if grep -Fq -- 'lacks --snapshot-signing-key-file' "$work_dir/dropin.err"; then
     exit 1
 fi
 grep -Fq -- 'lacks --trusted-snapshot-key' "$work_dir/dropin.err"
+grep -Fq -- 'lacks --clients-file or --allow-anonymous-feeds' "$work_dir/dropin.err"
+# --allow-anonymous-feeds alone satisfies the client-auth requirement.
+printf '%s\n' '[Service]' 'ExecStart=' \
+    'ExecStart=/usr/local/bin/mecfeed-serve --trusted-snapshot-key x --allow-anonymous-feeds' \
+    >"$serve_dropin_dir/20-anon.conf"
+stage_install >/dev/null 2>"$work_dir/anon.err"
+if grep -Eq -- 'lacks --clients-file|lacks --trusted-snapshot-key' "$work_dir/anon.err"; then
+    printf '%s\n' 'installer ignored a drop-in that supplies the serve flags' >&2
+    exit 1
+fi
 rm -r "$mcp_dropin_dir" "$serve_dropin_dir"
 
 # A retained matching .pub is normalized to 0644 (staged mode cannot chown).

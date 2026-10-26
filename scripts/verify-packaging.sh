@@ -323,7 +323,11 @@ exec_start=$(awk '
 if grep -nE '\$[A-Za-z_][A-Za-z0-9_]*[^A-Za-z0-9_[:space:]\\]' packaging/systemd/*.service packaging/systemd/*.example; then
     fail 'a unit uses $VAR inside a word; systemd needs ${VAR} there'
 fi
-require '    --trusted-snapshot-key /etc/mecfeed-serve/snapshot-signing.pub' packaging/systemd/mecfeed-serve.service
+# shellcheck disable=SC1003
+require '    --trusted-snapshot-key /etc/mecfeed-serve/snapshot-signing.pub \' packaging/systemd/mecfeed-serve.service
+# shellcheck disable=SC2016
+require '    --clients-file ${CREDENTIALS_DIRECTORY}/clients.json' packaging/systemd/mecfeed-serve.service
+require 'LoadCredential=clients.json:/etc/mecfeed-serve/clients.json' packaging/systemd/mecfeed-serve.service
 require_contains '--init-snapshot-signing-key' "$installer"
 require_contains '--print-snapshot-signing-public-key' "$installer"
 require_service_directive EnvironmentFile /etc/mecfeedmcp/credentials.env
