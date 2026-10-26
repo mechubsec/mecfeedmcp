@@ -36,11 +36,12 @@ LABEL org.opencontainers.image.description="Read-only TLS feed server firewalls 
 LABEL org.opencontainers.image.source="https://github.com/mechubsec/mecfeedmcp"
 LABEL org.opencontainers.image.licenses="MIT"
 
-# TLS, snapshot and trust paths live in ENTRYPOINT so an operator --listen override cannot drop them.
+# TLS, snapshot, trust and client-list paths live in ENTRYPOINT so an operator --listen override cannot drop them.
 ENTRYPOINT ["/usr/local/bin/mecfeed-serve", \
     "--tls-cert", "/etc/mecfeed-serve/tls.crt", \
     "--tls-key", "/etc/mecfeed-serve/tls.key", \
     "--snapshot-dir", "/var/lib/mecfeed-snapshots", \
     "--feed-config", "/etc/mecfeedmcp/feed.json", \
-    "--trusted-snapshot-key", "/etc/mecfeed-serve/snapshot-signing.pub"]
+    "--trusted-snapshot-key", "/etc/mecfeed-serve/snapshot-signing.pub", \
+    "--clients-file", "/etc/mecfeed-serve/clients.json"]
 CMD ["--listen", "0.0.0.0:8443"]
