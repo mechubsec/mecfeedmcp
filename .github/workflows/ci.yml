@@ -254,7 +254,7 @@ jobs:
       - name: Build image
         run: docker build --tag mecfeedmcp:ci .
       - name: Conformance
-        uses: mechubsec/mecmcp/packaging/conformance@982b4d3e8cc660c97fe99826febac1476542cce5 # v0.28.2
+        uses: mechubsec/mecmcp/packaging/conformance@8557155ed1ecd24e7ae25948d70485f0fc8c8451 # v0.30.1
         with:
           staging: staging
           manifest: staging/conformance.toml
