@@ -48,7 +48,7 @@ The feed server is on the enforcement path of every subscribed firewall, so it i
 - **TLS only**, modern ciphers; optional **mTLS** and/or per-feed credentials (HTTP Basic for firewalls that support it) and a **client IP/CIDR allowlist**.
 - **Integrity**: every snapshot carries a digest-signed manifest; the server refuses to serve a snapshot whose manifest does not verify. `ETag`/`If-None-Match` so firewalls fetch only on change.
 - **Abuse limits**: request size/time limits, per-client rate limits, structured access log feeding the mecmcp audit pipeline.
-- **mecmcp image rules** ([DOCKER-STANDARD](https://github.com/mechubsec/mecmcp/blob/main/docs/DOCKER-STANDARD.md), [PACKAGING](https://github.com/mechubsec/mecmcp/blob/main/docs/PACKAGING.md)): distroless `cc-debian13:nonroot`, uid/gid **65532**, no shell, read-only root filesystem, `cap_drop: ALL`, linux/amd64, cosign-signed and SBOM-attested images published on signed tags to GHCR and Docker Hub, plus the signed Debian 13 LXC tarball.
+- **mecmcp image rules** ([DOCKER-STANDARD](https://github.com/mechubsec/mecmcp/blob/main/docs/DOCKER-STANDARD.md), [PACKAGING](https://github.com/mechubsec/mecmcp/blob/main/docs/PACKAGING.md)): distroless `cc-debian13:nonroot`, uid/gid **65532**, no shell, read-only root filesystem, `cap_drop: ALL`, linux/amd64 + linux/arm64, cosign-signed and SBOM-attested images published on signed tags to GHCR and Docker Hub, plus the signed Debian 13 LXC tarball.
 
 ## What stays out of this repo
 

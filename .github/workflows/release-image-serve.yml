@@ -6,10 +6,11 @@ name: Release feed server image
 # name (upload-artifact v7 refuses a second upload). A second workflow
 # file is a second run, so the names do not meet.
 #
-# reusable-release-image.yml@v0.28.1 has a context input and no file
-# input. smoke-test-command runs after that workflow's checkout and
-# before the build, so copying Dockerfile.serve over Dockerfile selects
-# the feed server image.
+# reusable-release-image.yml has a context input and no file input.
+# smoke-test-command runs on every platform runner after that workflow's
+# checkout and before that platform's build, so copying Dockerfile.serve
+# over Dockerfile selects the feed server image on every leg. The per-
+# platform digest artifacts collide across two calls in one run too.
 #
 # GHCR packages pushed with GITHUB_TOKEN must live under this repository:
 # ghcr.io/mechubsec/mecfeedmcp/mecfeed-serve. Docker Hub is a separate
@@ -26,12 +27,11 @@ jobs:
       contents: read
       packages: write
       id-token: write
-    uses: mechubsec/mecmcp/.github/workflows/reusable-release-image.yml@39e7308cda922dadad18a0b0a5775ec1ab4a0bca # v0.32.0
+    uses: mechubsec/mecmcp/.github/workflows/reusable-release-image.yml@ab6786faca282cfbfffed5668f6a15929ce26bef # v0.33.1
     with:
       image: ghcr.io/${{ github.repository }}/mecfeed-serve
       dockerhub-image: docker.io/mechub/mecfeed-serve
       description: 'Read-only TLS feed server firewalls pull from'
-      platforms: linux/amd64
       smoke-test-command: cp Dockerfile.serve Dockerfile
     secrets:
       dockerhub-username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -56,6 +56,10 @@ jobs:
         with:
           version: v0.70.0
       - name: Scan pushed image
+        # The digest is a multi-arch manifest list, so scan each platform.
+        # --image-src remote: a local daemon copy would silently win over --platform.
         run: |
-          trivy image --scanners vuln --exit-code 1 --ignore-unfixed \
-            "ghcr.io/${{ github.repository }}/mecfeed-serve@${{ needs.release-serve.outputs.digest }}"
+          for platform in linux/amd64 linux/arm64; do
+            trivy image --image-src remote --platform "${platform}" --scanners vuln --exit-code 1 --ignore-unfixed \
+              "ghcr.io/${{ github.repository }}/mecfeed-serve@${{ needs.release-serve.outputs.digest }}"
+          done
