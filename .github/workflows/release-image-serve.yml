@@ -27,7 +27,7 @@ jobs:
       contents: read
       packages: write
       id-token: write
-    uses: mechubsec/mecmcp/.github/workflows/reusable-release-image.yml@ab6786faca282cfbfffed5668f6a15929ce26bef # v0.33.1
+    uses: mechubsec/mecmcp/.github/workflows/reusable-release-image.yml@78f0b978cf67ca10547cce4c15111eb7a872d886 # v0.33.2
     with:
       image: ghcr.io/${{ github.repository }}/mecfeed-serve
       dockerhub-image: docker.io/mechub/mecfeed-serve
