@@ -5,6 +5,8 @@
 - Workspace scaffold: `mecfeedmcp-core`, `mecfeedmcp`, `mecfeed-serve`.
 - CI, cargo-deny, cargo-audit, gitleaks, CodeQL, packaging conformance.
 - Distroless images and the mecmcp v0.28.1 release pipeline.
+- Images for `linux/amd64` and `linux/arm64`, each built on a native runner; the
+  post-release Trivy scan covers both (mechubsec/rustjunosmcp#648).
 - Empty MCP tool surface and empty read-only feed server. Not usable in production.
 - Indicator checks reject special-purpose ranges and overly broad prefixes.
 - `mecfeedmcp-core` admits indicators, versions immutable snapshots, and renders vendor feed documents.
