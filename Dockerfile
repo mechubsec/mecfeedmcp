@@ -5,7 +5,7 @@
 # (trixie) on both sides.
 
 # Pinned to the multi-arch image index digest resolved on 2026-08-25.
-FROM rust:1.99-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581 AS builder
+FROM rust:1.99-slim-trixie@sha256:f6c4a35d21dbb3c89d7a8d056c193e94fc09037f2b58dd858b09c39a47dd02d7 AS builder
 
 WORKDIR /build
 
