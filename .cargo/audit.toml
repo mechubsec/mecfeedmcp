@@ -1,0 +1,5 @@
+[advisories]
+ignore = [
+    # chrono is unmaintained (no fix exists); required non-optionally by rmcp and oauth2. Mirrors deny.toml.
+    "RUSTSEC-2026-0543",
+]
