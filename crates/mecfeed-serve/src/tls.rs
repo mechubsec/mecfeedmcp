@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use axum_server::{
     accept::Accept,
+    tls::TlsService,
     tls_rustls::{RustlsAcceptor, RustlsConfig},
 };
 use rustls::{
@@ -102,11 +103,11 @@ impl<I, S> Accept<I, S> for PeerCertAcceptor
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: Send + 'static,
-    RustlsAcceptor: Accept<I, S, Stream = TlsStream<I>, Service = S>,
+    RustlsAcceptor: Accept<I, S, Stream = TlsStream<I>, Service = TlsService<S>>,
     <RustlsAcceptor as Accept<I, S>>::Future: Send + 'static,
 {
     type Stream = TlsStream<I>;
-    type Service = WithPeerCert<S>;
+    type Service = WithPeerCert<TlsService<S>>;
     type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
 
     fn accept(&self, stream: I, service: S) -> Self::Future {
