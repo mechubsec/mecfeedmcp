@@ -9,7 +9,7 @@ cargo test --workspace --locked
 cargo +1.89 check --workspace --all-targets --locked
 ```
 
-MSRV is 1.89; the pinned toolchain in `rust-toolchain.toml` is 1.99.0.
+MSRV is 1.89; the pinned toolchain in `rust-toolchain.toml` is 1.100.0.
 
 ## Packaging
 
