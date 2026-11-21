@@ -50,6 +50,16 @@ jobs:
         run: docker build --tag mecfeedmcp:ci .
       - name: Build feed-server image
         run: docker build --file Dockerfile.serve --tag mecfeed-serve:ci .
+      - name: Verify images carry no OpenSSL and still ship libgcc_s
+        run: |
+          for image in mecfeedmcp:ci mecfeed-serve:ci; do
+            container_id=$(docker create "$image")
+            image_files=$(docker export "$container_id" | tar -t)
+            docker rm "$container_id" > /dev/null
+            if grep -E 'lib(ssl|crypto)' <<<"$image_files"; then echo "FAIL: $image contains libssl or libcrypto"; exit 1; fi
+            grep -q '/libgcc_s\.so\.1$' <<<"$image_files" || { echo "FAIL: $image is missing libgcc_s.so.1"; exit 1; }
+          done
+          echo "PASS: no libssl/libcrypto, libgcc_s present"
       - name: Verify config paths survive operator overrides
         run: |
           container_id=$(docker create mecfeedmcp:ci --host 0.0.0.0)

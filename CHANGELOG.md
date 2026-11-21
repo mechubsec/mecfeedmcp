@@ -7,6 +7,7 @@
 - Distroless images and the mecmcp v0.28.1 release pipeline.
 - Images for `linux/amd64` and `linux/arm64`, each built on a native runner; the
   post-release Trivy scan covers both (mechubsec/rustjunosmcp#648).
+- Images run on `distroless/base-nossl-debian13` (plus `libgcc_s.so.1` and its dpkg record), not `cc-debian13`, so they carry no `libssl3t64` or its unfixed CVE-2026-124709.
 - Empty MCP tool surface and empty read-only feed server. Not usable in production.
 - Indicator checks reject special-purpose ranges and overly broad prefixes.
 - `mecfeedmcp-core` admits indicators, versions immutable snapshots, and renders vendor feed documents.
