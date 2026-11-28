@@ -6,7 +6,7 @@
 
 # Source of libgcc-s1 only; the runtime is base-nossl, which lacks it. Not the
 # runtime itself, so keep it ahead of the builder and out of the last FROM.
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2 AS libgcc
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:29ee70762214fe8190cea04ef1c0a84a8365879e047ce8f911ae5a5ab2355fa2 AS libgcc
 
 # Pinned to the multi-arch image index digest resolved on 2026-08-25.
 FROM rust:1.100-slim-trixie@sha256:6f14b2b4b278ec0d50aa1d69541c304ce0f95e0f6268487aa9924af1c2e9aebe AS builder
